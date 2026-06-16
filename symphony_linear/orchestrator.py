@@ -35,6 +35,7 @@ from symphony_linear.tracker import (
     Tracker,
     TrackerError,
     TrackerNotFoundError,
+    TrackerTransientError,
     TransitionTarget,
     is_bot_comment,
 )
@@ -1621,6 +1622,9 @@ class Orchestrator:
     def _fetch_triggered_issues(self) -> list[Issue]:
         try:
             return self._tracker.list_triggered_issues()
+        except TrackerTransientError as exc:
+            logger.warning("Failed to fetch triggered issues (transient): %s", exc)
+            return []
         except Exception:
             logger.exception("Failed to fetch triggered issues")
             return []
