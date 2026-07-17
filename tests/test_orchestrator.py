@@ -37,7 +37,7 @@ from symphony_linear.project_config import (
     ProjectConfigError,
 )
 from symphony_linear.state import StateManager, TicketState, TicketStatus
-from symphony_linear.tracker import TransitionTarget
+from symphony_linear.tracker import TrackerError, TransitionTarget
 from symphony_linear.webhook import WebhookServer
 
 
@@ -3761,7 +3761,7 @@ class TestReconcileServe:
         state_mgr: StateManager,
         linear: FakeLinearClient,
     ) -> None:
-        """ServeScriptMissing → comment posted on ticket, _active_serve unchanged."""
+        """ServeScriptMissing → ticket is transitioned, then comment is posted."""
         from symphony_linear.workspace import ServeScriptMissing
 
         config = _make_qa_config(tmp_path)
@@ -3777,13 +3777,66 @@ class TestReconcileServe:
         with mock.patch(
             "symphony_linear.orchestrator.start_serve",
             side_effect=ServeScriptMissing("no serve script"),
-        ):
+        ) as m_start_serve:
             orch._reconcile_serve([issue], {issue.id: issue})
+            # The successful transition removes the issue from the QA set on
+            # the next tick, so it must not be retried or notified again.
+            orch._reconcile_serve([], {})
 
         assert orch._active_serve is None
+        m_start_serve.assert_called_once()
+        transition_calls = linear.calls.get("transition_to_state", [])
+        assert [
+            (tid, state) for tid, state in transition_calls if tid == "ticket-1"
+        ] == [("ticket-1", "Needs Input")]
         post_calls = linear.calls.get("post_comment", [])
-        assert any("ticket-1" == tid for tid, _ in post_calls)
-        assert any("QA serve failed to start" in body for _, body in post_calls)
+        ticket_comments = [(tid, body) for tid, body in post_calls if tid == "ticket-1"]
+        assert len(ticket_comments) == 1
+        assert "QA serve failed to start" in ticket_comments[0][1]
+
+    def test_start_serve_raises_serve_script_missing_transition_fails_no_comment(
+        self,
+        tmp_path: Path,
+        state_mgr: StateManager,
+        linear: FakeLinearClient,
+    ) -> None:
+        """A failed transition suppresses the serve-start failure comment."""
+        from symphony_linear.workspace import ServeScriptMissing
+
+        config = _make_qa_config(tmp_path)
+        orch = Orchestrator(
+            config=config,
+            state=state_mgr,
+            tracker=LinearTracker(linear=linear, config=config.linear),
+            workspace=tmp_path / "ws",
+        )  # type: ignore[arg-type]
+        _add_ticket_state(orch)
+        linear.set_response("transition_to_state", TrackerError("transition failed"))
+
+        issue = _make_qa_issue()
+        with mock.patch(
+            "symphony_linear.orchestrator.start_serve",
+            side_effect=ServeScriptMissing("no serve script"),
+        ):
+            orch._reconcile_serve([issue], {issue.id: issue})
+            # A failed transition leaves the issue in QA, so the next tick
+            # retries the transition but still must not post another comment.
+            orch._reconcile_serve([issue], {issue.id: issue})
+
+        transition_calls = linear.calls.get("transition_to_state", [])
+        assert all(
+            (tid, state) == ("ticket-1", "Needs Input")
+            for tid, state in transition_calls
+            if tid == "ticket-1"
+        )
+        assert [
+            (tid, state) for tid, state in transition_calls if tid == "ticket-1"
+        ] == [
+            ("ticket-1", "Needs Input"),
+            ("ticket-1", "Needs Input"),
+        ]
+        post_calls = linear.calls.get("post_comment", [])
+        assert not any(tid == "ticket-1" for tid, _ in post_calls)
 
     def test_start_serve_raises_file_not_found(
         self,
@@ -3791,7 +3844,7 @@ class TestReconcileServe:
         state_mgr: StateManager,
         linear: FakeLinearClient,
     ) -> None:
-        """FileNotFoundError (bwrap missing) → comment posted, _active_serve unchanged."""
+        """FileNotFoundError (bwrap missing) → transitioned, then commented."""
         config = _make_qa_config(tmp_path)
         orch = Orchestrator(
             config=config,
@@ -3809,8 +3862,14 @@ class TestReconcileServe:
             orch._reconcile_serve([issue], {issue.id: issue})
 
         assert orch._active_serve is None
+        transition_calls = linear.calls.get("transition_to_state", [])
+        assert [
+            (tid, state) for tid, state in transition_calls if tid == "ticket-1"
+        ] == [("ticket-1", "Needs Input")]
         post_calls = linear.calls.get("post_comment", [])
-        assert any("QA serve failed to start" in body for _, body in post_calls)
+        ticket_comments = [(tid, body) for tid, body in post_calls if tid == "ticket-1"]
+        assert len(ticket_comments) == 1
+        assert "QA serve failed to start" in ticket_comments[0][1]
 
     def test_winner_has_no_state_entry_transitions_then_posts_comment(
         self,

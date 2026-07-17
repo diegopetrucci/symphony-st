@@ -595,6 +595,14 @@ class Orchestrator:
             )
         except (ServeScriptMissing, WorkspaceError, FileNotFoundError) as exc:
             logger.error("Failed to start QA serve for %s: %s", winner.identifier, exc)
+            try:
+                self._tracker.transition_to(winner_id, TransitionTarget.needs_input)
+            except TrackerError:
+                logger.exception(
+                    "Failed to transition QA winner %s to needs_input after serve start failure",
+                    winner_id,
+                )
+                return
             self._post_comment_safe(
                 winner_id,
                 f"**Symphony**: QA serve failed to start:\n```\n{exc}\n```",
