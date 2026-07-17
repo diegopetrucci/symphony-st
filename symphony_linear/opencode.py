@@ -158,6 +158,13 @@ class OpenCodeError(Exception):
 class OpenCodeTimeout(Exception):
     """OpenCode process timed out and was killed."""
 
+    def __init__(
+        self, message: str, partial_message: str = "", session_id: str | None = None
+    ) -> None:
+        super().__init__(message)
+        self.partial_message = partial_message
+        self.session_id = session_id
+
 
 class OpenCodeCancelled(Exception):
     """OpenCode process was killed externally (e.g. label removed)."""
@@ -312,6 +319,52 @@ def run_resume(
 # ---------------------------------------------------------------------------
 
 
+def _parse_stream(stdout_text: str) -> tuple[str | None, list[dict]]:
+    """Parse a lenient NDJSON stream and return session id and events.
+
+    Corrupt lines are logged at DEBUG and skipped.  JSON values that are
+    not dicts (e.g. ``null``) are also skipped.  A mid-line-truncated
+    final line that can't be parsed as JSON is silently dropped, which is
+    the desired behaviour for partially received timeout output.
+
+    Does **not** call :func:`_assemble_message` — the caller decides when
+    (and whether) to assemble.  On the happy path assembly should happen
+    *after* validation; on the timeout path a defensive try/except wraps
+    the call so no partial-output garbage can mask the timeout.
+
+    Returns:
+        ``(session_id, parsed_events)`` — ``session_id`` is ``None`` when
+        no event carried one; ``parsed_events`` may be empty.
+    """
+    session_id: str | None = None
+    parsed_events: list[dict] = []
+
+    for line in stdout_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        try:
+            event = json.loads(stripped)
+        except json.JSONDecodeError:
+            logger.debug("Skipping unparseable JSON line: %s", stripped[:200])
+            continue
+
+        # Skip JSON values that aren't dicts (e.g. ``null``, ``42``).
+        if not isinstance(event, dict):
+            logger.debug("Skipping non-dict JSON value: %s", stripped[:200])
+            continue
+
+        if session_id is None:
+            sid = event.get("sessionID")
+            if sid:
+                session_id = sid
+
+        parsed_events.append(event)
+
+    return session_id, parsed_events
+
+
 def _execute(
     cmd: list[str],
     workspace_path: str,
@@ -341,11 +394,6 @@ def _execute(
     # Let the caller register the Popen handle immediately.
     on_subprocess(proc)
 
-    # Parse the JSON stream from stdout with a timeout.
-    session_id: str | None = None
-    parsed_events: list[dict] = []
-    stderr_tail: str = ""
-
     try:
         # ------------------------------------------------------------------
         # Read stdout line-by-line within the timeout window.
@@ -355,10 +403,23 @@ def _execute(
         except subprocess.TimeoutExpired:
             proc.kill()
             stdout_bytes, stderr_bytes = proc.communicate()
+            stdout_tail = stdout_bytes.decode(errors="replace")
             stderr_tail = _tail(stderr_bytes.decode(errors="replace"))
+            # Best-effort salvage of partial output — must never mask the timeout.
+            try:
+                partial_session_id, partial_events = _parse_stream(stdout_tail)
+                partial_message = _assemble_message(partial_events)
+            except Exception:
+                logger.debug(
+                    "Failed to salvage partial output on timeout", exc_info=True
+                )
+                partial_session_id = None
+                partial_message = ""
             raise OpenCodeTimeout(
                 f"OpenCode turn timed out after {timeout_seconds}s\n"
-                f"stderr: {stderr_tail}"
+                f"stderr: {stderr_tail}",
+                partial_message=partial_message,
+                session_id=partial_session_id,
             )
 
         # ------------------------------------------------------------------
@@ -375,26 +436,9 @@ def _execute(
             )
 
         # ------------------------------------------------------------------
-        # Parse NDJSON events.
+        # Parse NDJSON events (lenient — corrupt lines are skipped).
         # ------------------------------------------------------------------
-        for line in stdout_text.splitlines():
-            stripped = line.strip()
-            if not stripped:
-                continue
-
-            try:
-                event = json.loads(stripped)
-            except json.JSONDecodeError:
-                logger.debug("Skipping unparseable JSON line: %s", stripped[:200])
-                continue
-
-            # Capture session id from the first event that has one.
-            if session_id is None:
-                sid = event.get("sessionID")
-                if sid:
-                    session_id = sid
-
-            parsed_events.append(event)
+        session_id, parsed_events = _parse_stream(stdout_text)
 
         # ------------------------------------------------------------------
         # Extract context tokens from the last step_finish.
@@ -423,6 +467,10 @@ def _execute(
                 f"stderr: {stderr_tail[:2000]}"
             )
 
+        # ------------------------------------------------------------------
+        # Assemble final message (after validation so malformed-but-parseable
+        # output doesn't mask exit-code / signal / missing-session errors).
+        # ------------------------------------------------------------------
         final_message = _assemble_message(parsed_events)
 
         return session_id, final_message, context_tokens
@@ -452,8 +500,12 @@ def _assemble_message(events: list[dict]) -> str:
     """
     segments: list[str] = []
     for event in events:
+        if not isinstance(event, dict):
+            continue
         event_type = event.get("type")
-        part = event.get("part", {})
+        part = event.get("part")
+        if not isinstance(part, dict):
+            part = {}
 
         if event_type == "text":
             text = part.get("text")

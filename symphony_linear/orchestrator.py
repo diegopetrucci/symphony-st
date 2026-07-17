@@ -1120,12 +1120,20 @@ class Orchestrator:
                 attachments_path=host_attachments_dir,
                 files=files,
             )
-        except OpenCodeTimeout:
+        except OpenCodeTimeout as exc:
             logger.error("OpenCode turn timed out for %s", tid)
+            body = (
+                f"**Symphony error**: The AI turn timed out after "
+                f"{effective_turn_timeout}s."
+            )
+            if exc.partial_message:
+                body += (
+                    f"\n\nPartial output before the timeout:\n\n---\n\n"
+                    f"{exc.partial_message}"
+                )
             err_comment = self._post_comment_safe(
                 tid,
-                f"**Symphony error**: The AI turn timed out after "
-                f"{effective_turn_timeout}s.",
+                body,
                 return_comment=True,
             )
             with self._state_lock:
@@ -1133,7 +1141,7 @@ class Orchestrator:
                 ticket_state.updated_at = _iso_now()
                 if err_comment is not None:
                     ticket_state.last_seen_comment_id = err_comment.id  # B1
-                ticket_state.session_id = None  # ensure no-session path on retry
+                ticket_state.session_id = exc.session_id  # salvaged session, if any
                 self._state.upsert(ticket_state)
                 self._state.save()
             return
@@ -1360,12 +1368,20 @@ class Orchestrator:
                 attachments_path=host_attachments_dir,
                 files=files_attach,
             )
-        except OpenCodeTimeout:
+        except OpenCodeTimeout as exc:
             logger.error("OpenCode resume timed out for %s", tid)
+            body = (
+                f"**Symphony error**: The AI turn timed out after "
+                f"{effective_turn_timeout}s."
+            )
+            if exc.partial_message:
+                body += (
+                    f"\n\nPartial output before the timeout:\n\n---\n\n"
+                    f"{exc.partial_message}"
+                )
             err_comment = self._post_comment_safe(
                 tid,
-                f"**Symphony error**: The AI turn timed out after "
-                f"{effective_turn_timeout}s.",
+                body,
                 return_comment=True,
             )
             with self._state_lock:

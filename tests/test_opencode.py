@@ -18,8 +18,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from symphony_linear.opencode import (
+    OpenCodeTimeout,
     _assemble_message,
     _extract_context_tokens,
+    _parse_stream,
     run_initial,
     run_resume,
 )
@@ -260,6 +262,305 @@ class TestAssembleMessage:
         assert result == "*My Tool*"
         assert "_My Tool_" not in result
         assert "**My Tool**" not in result
+
+
+# ---------------------------------------------------------------------------
+# Unit: _parse_stream shared helper + OpenCodeTimeout
+# ---------------------------------------------------------------------------
+
+
+class TestParseStream:
+    """Verify the lenient NDJSON stream parser (returns session_id + events only)."""
+
+    def test_parse_stream_extracts_session_id_and_events(self) -> None:
+        """A valid stream yields session_id and parsed events."""
+        events = [
+            {"type": "step_start", "sessionID": "ses_abc", "part": {}},
+            {"type": "text", "sessionID": "ses_abc", "part": {"text": "Hello"}},
+            {
+                "type": "step_finish",
+                "sessionID": "ses_abc",
+                "part": {"tokens": {"input": 10}},
+            },
+        ]
+        stdout = "\n".join(json.dumps(e) for e in events)
+        session_id, parsed = _parse_stream(stdout)
+        assert session_id == "ses_abc"
+        assert len(parsed) == 3
+        msg = _assemble_message(parsed)
+        assert msg == "Hello"
+
+    def test_partial_stream_with_truncated_last_line(self) -> None:
+        """A mid-line-truncated last event is skipped without error."""
+        stdout = (
+            json.dumps({"type": "step_start", "sessionID": "ses_123", "part": {}})
+            + "\n"
+            + json.dumps(
+                {
+                    "type": "text",
+                    "sessionID": "ses_123",
+                    "part": {"text": "Partial output"},
+                }
+            )
+            + "\n"
+            + '{"type":"text","sessionID":"ses_123","part":{"text":"trunc'  # truncated
+        )
+        session_id, parsed = _parse_stream(stdout)
+        assert session_id == "ses_123"
+        assert len(parsed) == 2
+        msg = _assemble_message(parsed)
+        assert msg == "Partial output"
+
+    def test_empty_stdout_yields_no_session_and_empty_events(self) -> None:
+        """Empty stdout produces no session_id and empty events list."""
+        session_id, parsed = _parse_stream("")
+        assert session_id is None
+        assert parsed == []
+
+    def test_garbage_stdout_yields_no_session_and_empty_events(self) -> None:
+        """Completely unparseable stdout is silently skipped."""
+        session_id, parsed = _parse_stream("not json at all\n{garbage}\nbork")
+        assert session_id is None
+        assert parsed == []
+
+    def test_blank_lines_are_skipped(self) -> None:
+        """Blank lines between events are skipped silently."""
+        events = [
+            {"type": "text", "sessionID": "ses_x", "part": {"text": "A"}},
+        ]
+        stdout = "\n\n" + json.dumps(events[0]) + "\n\n"
+        session_id, parsed = _parse_stream(stdout)
+        assert session_id == "ses_x"
+        assert len(parsed) == 1
+
+    def test_tool_use_events_parsed_in_partial_stream(self) -> None:
+        """tool_use events in a partial stream are captured as events."""
+        events = [
+            {"type": "step_start", "sessionID": "ses_t", "part": {}},
+            {"type": "text", "sessionID": "ses_t", "part": {"text": "Running..."}},
+            {
+                "type": "tool_use",
+                "sessionID": "ses_t",
+                "part": {
+                    "tool": "bash",
+                    "state": {"title": "Installing deps", "status": "running"},
+                },
+            },
+        ]
+        stdout = "\n".join(json.dumps(e) for e in events)
+        _, parsed = _parse_stream(stdout)
+        msg = _assemble_message(parsed)
+        assert msg == "Running...\n\n*Installing deps*"
+
+    def test_step_finish_in_partial_stream(self) -> None:
+        """step_finish events are parsed but contribute nothing to message."""
+        events = [
+            {
+                "type": "step_finish",
+                "sessionID": "ses_f",
+                "part": {"reason": "stop", "tokens": {"input": 5}},
+            },
+        ]
+        stdout = "\n".join(json.dumps(e) for e in events)
+        _, parsed = _parse_stream(stdout)
+        msg = _assemble_message(parsed)
+        assert msg == ""
+
+    def test_null_json_line_is_skipped(self) -> None:
+        """A line containing valid JSON ``null`` is skipped (not a dict)."""
+        stdout = (
+            json.dumps({"type": "text", "sessionID": "ses_n", "part": {"text": "Hi"}})
+            + "\nnull\n"
+        )
+        session_id, parsed = _parse_stream(stdout)
+        assert session_id == "ses_n"
+        assert len(parsed) == 1
+
+    def test_nested_null_json_is_skipped(self) -> None:
+        """A line containing a JSON array is skipped (not a dict)."""
+        stdout = (
+            json.dumps({"type": "text", "sessionID": "ses_arr", "part": {"text": "X"}})
+            + "\n[]\n"
+        )
+        session_id, parsed = _parse_stream(stdout)
+        assert session_id == "ses_arr"
+        assert len(parsed) == 1
+
+    def test_event_with_null_part_does_not_break_assembly(self) -> None:
+        """An event with ``"part": null`` is parseable but assembly handles None."""
+        event = {"type": "text", "sessionID": "ses_p", "part": None}
+        stdout = json.dumps(event) + "\n"
+        session_id, parsed = _parse_stream(stdout)
+        assert session_id == "ses_p"
+        assert len(parsed) == 1
+        # _assemble_message must not raise on part=None.
+        msg = _assemble_message(parsed)
+        assert msg == ""
+
+
+class TestExecuteTimeout:
+    """Verify the real timeout path through :func:`_execute` (mocked Popen)."""
+
+    @staticmethod
+    def _make_timeout_proc(
+        partial_stdout: bytes, exit_after_kill: int = -9
+    ) -> MagicMock:
+        """Return a mock Popen that simulates a timeout then kill."""
+        proc = MagicMock(spec=subprocess.Popen)
+        # First communicate() raises TimeoutExpired.
+        proc.communicate.side_effect = [
+            subprocess.TimeoutExpired(cmd=["opencode"], timeout=30, output=b""),
+            (partial_stdout, b""),  # second communicate after kill
+        ]
+        proc.returncode = exit_after_kill
+        return proc
+
+    def test_timeout_carries_partial_message_and_session(self) -> None:
+        """Timeout via _execute salvages session_id and partial message."""
+        stdout = (
+            json.dumps({"type": "step_start", "sessionID": "ses_timeout", "part": {}})
+            + "\n"
+            + json.dumps(
+                {
+                    "type": "text",
+                    "sessionID": "ses_timeout",
+                    "part": {"text": "I was in the middle of..."},
+                }
+            )
+            + "\n"
+        ).encode()
+        proc = self._make_timeout_proc(stdout)
+        with patch(
+            "symphony_linear.opencode.run_in_sandbox", return_value=proc
+        ) as mock_sandbox:
+            with pytest.raises(OpenCodeTimeout) as excinfo:
+                run_initial(
+                    workspace_path="/ws",
+                    prompt="do it",
+                    timeout_seconds=30,
+                    on_subprocess=lambda p: None,
+                )
+        assert excinfo.value.session_id == "ses_timeout"
+        assert excinfo.value.partial_message == "I was in the middle of..."
+        # Ensure the sandbox was actually called (not bypassed).
+        mock_sandbox.assert_called_once()
+
+    def test_timeout_with_null_line_does_not_mask_timeout(self) -> None:
+        """A ``null`` line in partial stdout is skipped; timeout still raised."""
+        stdout = (
+            json.dumps({"type": "step_start", "sessionID": "ses_nl", "part": {}})
+            + "\nnull\n"
+            + json.dumps(
+                {
+                    "type": "text",
+                    "sessionID": "ses_nl",
+                    "part": {"text": "Working..."},
+                }
+            )
+            + "\n"
+        ).encode()
+        proc = self._make_timeout_proc(stdout)
+        with patch("symphony_linear.opencode.run_in_sandbox", return_value=proc):
+            with pytest.raises(OpenCodeTimeout) as excinfo:
+                run_initial(
+                    workspace_path="/ws",
+                    prompt="do it",
+                    timeout_seconds=30,
+                    on_subprocess=lambda p: None,
+                )
+        assert excinfo.value.session_id == "ses_nl"
+        assert excinfo.value.partial_message == "Working..."
+
+    def test_timeout_with_null_part_does_not_mask_timeout(self) -> None:
+        """An event with ``"part": null`` does not mask the timeout."""
+        stdout = (
+            json.dumps({"type": "step_start", "sessionID": "ses_np", "part": {}})
+            + "\n"
+            + json.dumps({"type": "text", "sessionID": "ses_np", "part": None})
+            + "\n"
+            + json.dumps(
+                {
+                    "type": "text",
+                    "sessionID": "ses_np",
+                    "part": {"text": "More text"},
+                }
+            )
+            + "\n"
+        ).encode()
+        proc = self._make_timeout_proc(stdout)
+        with patch("symphony_linear.opencode.run_in_sandbox", return_value=proc):
+            with pytest.raises(OpenCodeTimeout) as excinfo:
+                run_initial(
+                    workspace_path="/ws",
+                    prompt="do it",
+                    timeout_seconds=30,
+                    on_subprocess=lambda p: None,
+                )
+        assert excinfo.value.session_id == "ses_np"
+        # null-part text event contributes nothing, "More text" does.
+        assert excinfo.value.partial_message == "More text"
+
+    def test_timeout_with_pure_garbage_stdout(self) -> None:
+        """Completely unparseable partial stdout still raises timeout."""
+        proc = self._make_timeout_proc(b"not json\n{garbage}")
+        with patch("symphony_linear.opencode.run_in_sandbox", return_value=proc):
+            with pytest.raises(OpenCodeTimeout) as excinfo:
+                run_initial(
+                    workspace_path="/ws",
+                    prompt="do it",
+                    timeout_seconds=30,
+                    on_subprocess=lambda p: None,
+                )
+        assert excinfo.value.session_id is None
+        assert excinfo.value.partial_message == ""
+
+    def test_timeout_with_no_session_id(self) -> None:
+        ("""Timeout with no sessionID in partial stdout still raises.""",)
+        stdout = (
+            json.dumps({"type": "text", "part": {"text": "No session here."}}) + "\n"
+        ).encode()
+        proc = self._make_timeout_proc(stdout)
+        with patch("symphony_linear.opencode.run_in_sandbox", return_value=proc):
+            with pytest.raises(OpenCodeTimeout) as excinfo:
+                run_initial(
+                    workspace_path="/ws",
+                    prompt="do it",
+                    timeout_seconds=30,
+                    on_subprocess=lambda p: None,
+                )
+        assert excinfo.value.session_id is None
+        assert excinfo.value.partial_message == "No session here."
+
+
+class TestOpenCodeTimeoutAttributes:
+    """Verify OpenCodeTimeout carries partial_message and session_id."""
+
+    def test_timeout_with_partial_output(self) -> None:
+        """Full partial output is captured as attributes."""
+        exc = OpenCodeTimeout(
+            "timed out",
+            partial_message="Hello\n\n*Running command*",
+            session_id="ses_partial",
+        )
+        assert exc.partial_message == "Hello\n\n*Running command*"
+        assert exc.session_id == "ses_partial"
+        assert "timed out" in str(exc)
+
+    def test_timeout_with_no_partial_output(self) -> None:
+        """When partial_message is empty (default), attributes are empty/None."""
+        exc = OpenCodeTimeout("timed out")
+        assert exc.partial_message == ""
+        assert exc.session_id is None
+
+    def test_timeout_with_message_only_no_session(self) -> None:
+        """Partial text without a sessionID event yields a message but no session."""
+        exc = OpenCodeTimeout(
+            "timed out",
+            partial_message="Partial text",
+            session_id=None,
+        )
+        assert exc.partial_message == "Partial text"
+        assert exc.session_id is None
 
 
 # ---------------------------------------------------------------------------

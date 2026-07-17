@@ -369,7 +369,135 @@ class TestNewTicketPipeline:
         assert ts is not None
         assert ts.status == TicketStatus.failed
         assert ts.last_seen_comment_id is not None  # B1
-        assert ts.session_id is None  # B1: nil'd out
+        assert ts.session_id is None  # no session in timeout exception
+
+    def test_opencode_timeout_persists_salvaged_session_id(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """Initial timeout with a salvaged session_id persists it to state."""
+        linear.set_response(
+            "get_project",
+            Project(
+                id="proj-1",
+                name="Test",
+                links=[
+                    ProjectLink(label="Repo", url="https://github.com/org/repo.git")
+                ],
+            ),
+        )
+        linear.set_response("get_issue", _make_issue(description="Fix"))
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.clone_workspace",
+                return_value=("/tmp/ws/TEAM-1", False),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.finalize_workspace",
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config",
+                return_value=ProjectConfig(),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.run_initial",
+                side_effect=OpenCodeTimeout(
+                    "timeout",
+                    partial_message="Partial work done.",
+                    session_id="ses_salvaged",
+                ),
+            ),
+        ):
+            orchestrator._new_ticket_pipeline(_make_issue())
+        ts = orchestrator._state.get("ticket-1")
+        assert ts is not None
+        assert ts.status == TicketStatus.failed
+        assert ts.session_id == "ses_salvaged"
+
+    def test_opencode_timeout_comment_includes_partial_output(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """Initial timeout comment includes partial message when present."""
+        linear.set_response(
+            "get_project",
+            Project(
+                id="proj-1",
+                name="Test",
+                links=[
+                    ProjectLink(label="Repo", url="https://github.com/org/repo.git")
+                ],
+            ),
+        )
+        linear.set_response("get_issue", _make_issue(description="Fix"))
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.clone_workspace",
+                return_value=("/tmp/ws/TEAM-1", False),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.finalize_workspace",
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config",
+                return_value=ProjectConfig(),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.run_initial",
+                side_effect=OpenCodeTimeout(
+                    "timeout",
+                    partial_message="I was working on...",
+                ),
+            ),
+        ):
+            orchestrator._new_ticket_pipeline(_make_issue())
+        # Check the comment body posted
+        post_calls = linear.calls.get("post_comment", [])
+        timeout_comments = [args[1] for args in post_calls if "timed out" in args[1]]
+        assert len(timeout_comments) == 1
+        assert "Partial output before the timeout" in timeout_comments[0]
+        assert "I was working on..." in timeout_comments[0]
+
+    def test_opencode_timeout_comment_unchanged_when_empty_partial(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """Initial timeout comment is unchanged when partial_message is empty."""
+        linear.set_response(
+            "get_project",
+            Project(
+                id="proj-1",
+                name="Test",
+                links=[
+                    ProjectLink(label="Repo", url="https://github.com/org/repo.git")
+                ],
+            ),
+        )
+        linear.set_response("get_issue", _make_issue(description="Fix"))
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.clone_workspace",
+                return_value=("/tmp/ws/TEAM-1", False),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.finalize_workspace",
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config",
+                return_value=ProjectConfig(),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.run_initial",
+                side_effect=OpenCodeTimeout(
+                    "timeout",
+                    partial_message="",
+                    session_id=None,
+                ),
+            ),
+        ):
+            orchestrator._new_ticket_pipeline(_make_issue())
+        # Check the comment body posted
+        post_calls = linear.calls.get("post_comment", [])
+        timeout_comments = [args[1] for args in post_calls if "timed out" in args[1]]
+        assert len(timeout_comments) == 1
+        assert "Partial output before the timeout" not in timeout_comments[0]
 
     def test_opencode_error_advances_last_seen(
         self, orchestrator: Orchestrator, linear: FakeLinearClient
@@ -1349,6 +1477,53 @@ class TestResumePipeline:
         updated = orchestrator._state.get("ticket-1")
         assert updated is not None
         assert updated.last_seen_comment_id != "cmt-seen-1"
+
+    def test_resume_timeout_comment_includes_partial_output(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """Resume timeout comment includes partial output when present."""
+        ts = self._make_ts()
+        orchestrator._state.upsert(ts)
+        linear.set_response("list_comments_since", [_make_comment("c1", "Go")])
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config",
+                return_value=ProjectConfig(),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.run_resume",
+                side_effect=OpenCodeTimeout("t", partial_message="Continuing work..."),
+            ),
+        ):
+            orchestrator._resume_pipeline(ts)
+        post_calls = linear.calls.get("post_comment", [])
+        timeout_comments = [args[1] for args in post_calls if "timed out" in args[1]]
+        assert len(timeout_comments) == 1
+        assert "Partial output before the timeout" in timeout_comments[0]
+        assert "Continuing work..." in timeout_comments[0]
+
+    def test_resume_timeout_comment_unchanged_when_empty_partial(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """Resume timeout comment unchanged when partial_message is empty."""
+        ts = self._make_ts()
+        orchestrator._state.upsert(ts)
+        linear.set_response("list_comments_since", [_make_comment("c1", "Go")])
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config",
+                return_value=ProjectConfig(),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.run_resume",
+                side_effect=OpenCodeTimeout("t", partial_message=""),
+            ),
+        ):
+            orchestrator._resume_pipeline(ts)
+        post_calls = linear.calls.get("post_comment", [])
+        timeout_comments = [args[1] for args in post_calls if "timed out" in args[1]]
+        assert len(timeout_comments) == 1
+        assert "Partial output before the timeout" not in timeout_comments[0]
 
     def test_no_retry_without_new_comment(
         self, orchestrator: Orchestrator, linear: FakeLinearClient
