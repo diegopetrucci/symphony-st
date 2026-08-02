@@ -44,6 +44,8 @@ from symphony_linear.workspace import (
     ServeScriptMissing,
     WorkspaceError,
     clone_workspace,
+    compute_workspace_path,
+    dirty_summary,
     ensure_attachments_dir,
     finalize_workspace,
     remove,
@@ -371,9 +373,19 @@ class Orchestrator:
                 if tid in issues_by_id:
                     continue
 
+                # Derive the path from the identifier, not the state entry:
+                # the entry may carry an empty or stale workspace_path (e.g.
+                # while bootstrapping), but the dirtiness check and the delete
+                # must inspect the same directory.
+                workspace_path = compute_workspace_path(
+                    ticket_state.ticket_identifier, str(self._workspace)
+                )
+
                 try:
                     current = self._tracker.get_issue(tid)
                 except TrackerNotFoundError:
+                    # Ticket deletion is a deliberate act — clean up
+                    # unconditionally, dirty or not.
                     logger.info("Ticket %s not found — cleaning up", tid)
                     self._cancel_ticket(tid)
                     identifier = ticket_state.ticket_identifier
@@ -393,6 +405,119 @@ class Orchestrator:
 
                 if self._is_still_triggered(current):
                     continue
+
+                summary = dirty_summary(workspace_path)
+                if summary is not None:
+                    if ticket_state.cleanup_refused_state is None:
+                        # First time cleanup fires on a dirty workspace: refuse.
+                        # Keep the state entry (and the in-flight turn's
+                        # ticket_state.status) and ask the human to decide.
+                        logger.info(
+                            "Ticket %s no longer triggered but workspace is dirty — "
+                            "refusing cleanup",
+                            tid,
+                        )
+                        needs_input_name = self._tracker.transition_name_for(
+                            TransitionTarget.needs_input
+                        )
+                        # Transition first, so the comment can report what
+                        # actually happened.
+                        transition_ok = True
+                        try:
+                            self._tracker.transition_to(
+                                tid, TransitionTarget.needs_input
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed to transition %s to '%s' during "
+                                "dirty-workspace refusal",
+                                tid,
+                                TransitionTarget.needs_input.value,
+                            )
+                            transition_ok = False
+                        moved_line = (
+                            f"I moved the ticket back to **{needs_input_name}**."
+                            if transition_ok
+                            else f"I could not move the ticket back to "
+                            f"**{needs_input_name}** — please move it yourself."
+                        )
+                        self._post_comment_safe(
+                            tid,
+                            (
+                                "**Workspace not clean — I did not delete it.**\n\n"
+                                "This ticket has work that only exists in its "
+                                "workspace:\n\n"
+                                f"{summary}\n\n"
+                                f"{moved_line} "
+                                "Commit and push the work, or ask me to do it. "
+                                "If you move the ticket out again, I will delete "
+                                "the workspace."
+                            ),
+                            kind="cleanup",
+                        )
+                        # Remember which state we left the ticket in: the
+                        # needs-input state if the transition worked, otherwise
+                        # wherever it already was.  A later tick deletes only
+                        # when the ticket has moved away from that state.
+                        ticket_state.cleanup_refused_state = (
+                            needs_input_name if transition_ok else current.state
+                        )
+                        ticket_state.updated_at = _iso_now()
+                        with self._state_lock:
+                            self._state.upsert(ticket_state)
+                            self._state.save()
+                        continue
+                    if current.state == ticket_state.cleanup_refused_state:
+                        # The ticket is exactly where we left it after the
+                        # refusal: either the human never moved it again (the
+                        # trigger went away for another reason — label removed,
+                        # archived), or the refusal transition itself failed and
+                        # the human has not acted.  Stop tracking but keep the
+                        # dirty directory, and tell the human where it is.
+                        logger.info(
+                            "Ticket %s no longer triggered, workspace still dirty, "
+                            "still in %s — dropping state, keeping workspace",
+                            tid,
+                            current.state,
+                        )
+                        self._post_comment_safe(
+                            tid,
+                            (
+                                "**Stopped tracking this ticket.**\n\n"
+                                "It is no longer triggered, but its workspace "
+                                "holds work that exists nowhere else, so I kept "
+                                "the directory:\n\n"
+                                f"`{workspace_path}`\n\n"
+                                "Trigger the ticket again and I will pick up "
+                                "that workspace where it is. Nothing deletes it "
+                                "on its own."
+                            ),
+                            kind="cleanup",
+                        )
+                        self._cancel_ticket(tid)
+                        if ticket_state.session_id is not None:
+                            record = SessionRecord(
+                                session_id=ticket_state.session_id,
+                                last_seen_comment_id=ticket_state.last_seen_comment_id,
+                            )
+                            self._state.set_session(tid, record)
+                        self._state.remove(tid)
+                        self._state.save()
+                        continue
+                    # The human moved the ticket out again — tell them what the
+                    # workspace held before the full cleanup (including rmtree)
+                    # deletes it.
+                    self._post_comment_safe(
+                        tid,
+                        (
+                            "**Workspace deleted.**\n\n"
+                            "You moved the ticket out again, so I deleted the "
+                            "workspace. It still held:\n\n"
+                            f"{summary}\n\n"
+                            "Those changes are gone."
+                        ),
+                        kind="cleanup",
+                    )
 
                 logger.info(
                     "Ticket %s no longer triggered (state=%s labels=%s archived=%s) — cleaning up",
@@ -1106,6 +1231,8 @@ class Orchestrator:
 
         # --- Run OpenCode (B3: pass hide_paths) ---
         ticket_state.status = TicketStatus.working
+        # Agent takes a turn — re-arm the dirty-workspace guard.
+        ticket_state.cleanup_refused_state = None
         with self._state_lock:
             self._state.upsert(ticket_state)
             self._state.save()
@@ -1350,6 +1477,8 @@ class Orchestrator:
 
         with self._state_lock:
             ticket_state.status = TicketStatus.working
+            # Agent takes a turn — re-arm the dirty-workspace guard.
+            ticket_state.cleanup_refused_state = None
             ticket_state.updated_at = _iso_now()
             self._state.upsert(ticket_state)
             self._state.save()

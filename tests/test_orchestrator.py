@@ -7,7 +7,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from unittest import mock
 
 import pytest
@@ -1425,6 +1425,27 @@ class TestResumePipeline:
         updated = orchestrator._state.get("ticket-1")
         assert updated is not None and updated.status == TicketStatus.needs_input
 
+    def test_resume_turn_clears_cleanup_refused_state(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """cleanup_refused_state is cleared when the agent takes a turn (status → working)."""
+        ts = self._make_ts(cleanup_refused_state="Needs Input")
+        orchestrator._state.upsert(ts)
+        linear.set_response("list_comments_since", [_make_comment("c1", "Fix please")])
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config",
+                return_value=ProjectConfig(),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.run_resume", return_value=("Done!", None)
+            ),
+        ):
+            orchestrator._resume_pipeline(ts)
+        updated = orchestrator._state.get("ticket-1")
+        assert updated is not None
+        assert updated.cleanup_refused_state is None
+
     def test_bot_comments_filtered(
         self, orchestrator: Orchestrator, linear: FakeLinearClient
     ) -> None:
@@ -2254,6 +2275,19 @@ class TestAttachmentWiringResume:
 
 
 class TestTick:
+    @pytest.fixture(autouse=True)
+    def dirty_summary(self) -> Iterator[mock.MagicMock]:
+        """Default all step-3 cleanup to 'clean' unless a test overrides this.
+
+        The real dirty_summary runs git commands, which fail (and report
+        'dirty') on the plain directories these tests create.  Tests exercising
+        the dirty-refusal logic set ``dirty_summary.return_value`` explicitly.
+        """
+        with mock.patch(
+            "symphony_linear.orchestrator.dirty_summary", return_value=None
+        ) as m:
+            yield m
+
     def _add_state(self, orchestrator: Orchestrator, **overrides: Any) -> TicketState:
         defaults: dict[str, Any] = {
             "ticket_id": "ticket-1",
@@ -2505,6 +2539,294 @@ class TestTick:
                 labels=["Agent"],
             ),
         )
+
+        orchestrator._tick()
+        time.sleep(0.2)
+
+        assert orchestrator._state.get("ticket-1") is None
+        assert not ws_dir.exists()
+
+    # --- Dirty-workspace cleanup refusal ---
+
+    def test_dirty_workspace_first_cleanup_refuses(
+        self,
+        orchestrator: Orchestrator,
+        linear: FakeLinearClient,
+        tmp_path: Path,
+        dirty_summary: mock.MagicMock,
+    ) -> None:
+        """Dirty workspace + first cleanup → no rmtree, comment posted, transitioned, state recorded."""
+        ws_root = tmp_path / "workspaces"
+        ws_dir = ws_root / "TEAM-1"
+        ws_dir.mkdir(parents=True)
+        (ws_dir / "sentinel").write_text("x")
+
+        self._add_state(orchestrator, workspace_path=str(ws_dir))
+        dirty_summary.return_value = "2 uncommitted files, 1 commit not on any remote."
+        linear.set_response("list_triggered_issues", [])
+        linear.set_response("get_issue", _make_issue(state="Done"))
+
+        orchestrator._tick()
+        time.sleep(0.2)
+
+        # State entry kept, workspace kept, refusal state recorded, status untouched.
+        ts = orchestrator._state.get("ticket-1")
+        assert ts is not None
+        assert ts.cleanup_refused_state == "Needs Input"
+        assert ts.status == TicketStatus.needs_input
+        assert ws_dir.exists()
+        # One comment with kind="cleanup", containing summary and needs-input name.
+        post_calls = linear.calls.get("post_comment", [])
+        assert len(post_calls) == 1
+        _, body = post_calls[0]
+        assert "**Workspace not clean — I did not delete it.**" in body
+        assert "2 uncommitted files, 1 commit not on any remote." in body
+        assert "**Needs Input**" in body
+        assert "*Symphony · cleanup*" in body
+        # Best-effort transition back to needs_input.
+        assert ("ticket-1", "Needs Input") in linear.calls.get(
+            "transition_to_state", []
+        )
+
+    def test_dirty_workspace_refused_still_in_needs_input_drops_state(
+        self,
+        orchestrator: Orchestrator,
+        linear: FakeLinearClient,
+        tmp_path: Path,
+        dirty_summary: mock.MagicMock,
+    ) -> None:
+        """Dirty + refusal recorded + issue still in needs_input → state dropped, dir kept, notice posted."""
+        ws_root = tmp_path / "workspaces"
+        ws_dir = ws_root / "TEAM-1"
+        ws_dir.mkdir(parents=True)
+        (ws_dir / "sentinel").write_text("x")
+
+        self._add_state(
+            orchestrator,
+            workspace_path=str(ws_dir),
+            cleanup_refused_state="Needs Input",
+        )
+        dirty_summary.return_value = "2 uncommitted files."
+        linear.set_response("list_triggered_issues", [])
+        linear.set_response("get_issue", _make_issue(state="Needs Input", labels=[]))
+
+        orchestrator._tick()
+        time.sleep(0.2)
+
+        assert orchestrator._state.get("ticket-1") is None
+        assert ws_dir.exists()
+        # Stop-tracking notice posted, carrying the workspace path.
+        post_calls = linear.calls.get("post_comment", [])
+        assert len(post_calls) == 1
+        _, body = post_calls[0]
+        assert "**Stopped tracking this ticket.**" in body
+        assert f"`{ws_dir}`" in body
+        assert "*Symphony · cleanup*" in body
+
+    def test_dirty_workspace_refusal_transition_failure_keeps_directory(
+        self,
+        orchestrator: Orchestrator,
+        linear: FakeLinearClient,
+        tmp_path: Path,
+        dirty_summary: mock.MagicMock,
+    ) -> None:
+        """Refusal transition fails → state records the current state; second pass keeps dir."""
+        ws_root = tmp_path / "workspaces"
+        ws_dir = ws_root / "TEAM-1"
+        ws_dir.mkdir(parents=True)
+        (ws_dir / "sentinel").write_text("x")
+
+        self._add_state(orchestrator, workspace_path=str(ws_dir))
+        dirty_summary.return_value = "2 uncommitted files."
+        linear.set_response("list_triggered_issues", [])
+        linear.set_response("get_issue", _make_issue(state="Done"))
+        linear.set_response("transition_to_state", LinearError("transition failed"))
+
+        # First tick: refusal, transition fails, records the state we saw (Done).
+        orchestrator._tick()
+        time.sleep(0.2)
+        ts = orchestrator._state.get("ticket-1")
+        assert ts is not None
+        assert ts.cleanup_refused_state == "Done"
+        assert ws_dir.exists()
+
+        # Second tick: ticket still in Done (== recorded state) → stop tracking,
+        # keep the dirty directory — no rmtree.
+        orchestrator._tick()
+        time.sleep(0.2)
+        assert orchestrator._state.get("ticket-1") is None
+        assert ws_dir.exists()
+
+    def test_dirty_workspace_empty_state_path_not_deleted(
+        self,
+        orchestrator: Orchestrator,
+        linear: FakeLinearClient,
+        tmp_path: Path,
+        dirty_summary: mock.MagicMock,
+    ) -> None:
+        """State entry with workspace_path='' → dirtiness is checked on the
+        identifier-derived directory, which then refuses deletion."""
+        ws_root = tmp_path / "workspaces"
+        ws_dir = ws_root / "TEAM-1"
+        ws_dir.mkdir(parents=True)
+        (ws_dir / "sentinel").write_text("x")
+
+        # workspace_path="" mirrors a bootstrapping entry whose clone/setup
+        # failed before the path was persisted.
+        self._add_state(orchestrator, workspace_path="")
+        dirty_summary.return_value = "2 uncommitted files."
+        linear.set_response("list_triggered_issues", [])
+        linear.set_response("get_issue", _make_issue(state="Done"))
+
+        orchestrator._tick()
+        time.sleep(0.2)
+
+        # The dirty check ran against the identifier-derived directory (not "").
+        dirty_summary.assert_called_with(str(ws_dir))
+        # First cleanup refused: state entry kept, dirty directory kept.
+        ts = orchestrator._state.get("ticket-1")
+        assert ts is not None
+        assert ts.cleanup_refused_state == "Needs Input"
+        assert ws_dir.exists()
+
+    def test_dirty_workspace_refused_moved_again_removes(
+        self,
+        orchestrator: Orchestrator,
+        linear: FakeLinearClient,
+        tmp_path: Path,
+        dirty_summary: mock.MagicMock,
+    ) -> None:
+        """Dirty + refusal recorded + issue moved elsewhere → full cleanup with rmtree."""
+        ws_root = tmp_path / "workspaces"
+        ws_dir = ws_root / "TEAM-1"
+        ws_dir.mkdir(parents=True)
+        (ws_dir / "sentinel").write_text("x")
+
+        self._add_state(
+            orchestrator,
+            workspace_path=str(ws_dir),
+            cleanup_refused_state="Needs Input",
+        )
+        dirty_summary.return_value = "2 uncommitted files."
+        linear.set_response("list_triggered_issues", [])
+        linear.set_response("get_issue", _make_issue(state="Done"))
+
+        orchestrator._tick()
+        time.sleep(0.2)
+
+        assert orchestrator._state.get("ticket-1") is None
+        assert not ws_dir.exists()
+        # Delete receipt posted before the rmtree, carrying the dirty summary.
+        post_calls = linear.calls.get("post_comment", [])
+        assert len(post_calls) == 1
+        _, body = post_calls[0]
+        assert "**Workspace deleted.**" in body
+        assert "2 uncommitted files." in body
+        assert "*Symphony · cleanup*" in body
+
+    def test_delete_receipt_failure_does_not_block_cleanup(
+        self,
+        orchestrator: Orchestrator,
+        linear: FakeLinearClient,
+        tmp_path: Path,
+        dirty_summary: mock.MagicMock,
+    ) -> None:
+        """A failed delete-receipt post does not stop the rmtree cleanup."""
+        ws_root = tmp_path / "workspaces"
+        ws_dir = ws_root / "TEAM-1"
+        ws_dir.mkdir(parents=True)
+        (ws_dir / "sentinel").write_text("x")
+
+        self._add_state(
+            orchestrator,
+            workspace_path=str(ws_dir),
+            cleanup_refused_state="Needs Input",
+        )
+        dirty_summary.return_value = "2 uncommitted files."
+        linear.set_response("list_triggered_issues", [])
+        linear.set_response("get_issue", _make_issue(state="Done"))
+        linear.set_response("post_comment", LinearError("post failed"))
+
+        orchestrator._tick()
+        time.sleep(0.2)
+
+        assert orchestrator._state.get("ticket-1") is None
+        assert not ws_dir.exists()
+
+    def test_stop_tracking_notice_failure_does_not_block(
+        self,
+        orchestrator: Orchestrator,
+        linear: FakeLinearClient,
+        tmp_path: Path,
+        dirty_summary: mock.MagicMock,
+    ) -> None:
+        """A failed stop-tracking notice does not stop dropping the state entry."""
+        ws_root = tmp_path / "workspaces"
+        ws_dir = ws_root / "TEAM-1"
+        ws_dir.mkdir(parents=True)
+        (ws_dir / "sentinel").write_text("x")
+
+        self._add_state(
+            orchestrator,
+            workspace_path=str(ws_dir),
+            cleanup_refused_state="Needs Input",
+        )
+        dirty_summary.return_value = "2 uncommitted files."
+        linear.set_response("list_triggered_issues", [])
+        linear.set_response("get_issue", _make_issue(state="Needs Input", labels=[]))
+        linear.set_response("post_comment", LinearError("post failed"))
+
+        orchestrator._tick()
+        time.sleep(0.2)
+
+        assert orchestrator._state.get("ticket-1") is None
+        assert ws_dir.exists()
+
+    def test_clean_workspace_cleanup_unchanged(
+        self,
+        orchestrator: Orchestrator,
+        linear: FakeLinearClient,
+        tmp_path: Path,
+        dirty_summary: mock.MagicMock,
+    ) -> None:
+        """Clean workspace → state entry and workspace removed, even with refusal recorded."""
+        ws_root = tmp_path / "workspaces"
+        ws_dir = ws_root / "TEAM-1"
+        ws_dir.mkdir(parents=True)
+        (ws_dir / "sentinel").write_text("x")
+
+        self._add_state(
+            orchestrator,
+            workspace_path=str(ws_dir),
+            cleanup_refused_state="Needs Input",
+        )
+        dirty_summary.return_value = None
+        linear.set_response("list_triggered_issues", [])
+        linear.set_response("get_issue", _make_issue(state="Done"))
+
+        orchestrator._tick()
+        time.sleep(0.2)
+
+        assert orchestrator._state.get("ticket-1") is None
+        assert not ws_dir.exists()
+
+    def test_deleted_ticket_dirty_workspace_removed(
+        self,
+        orchestrator: Orchestrator,
+        linear: FakeLinearClient,
+        tmp_path: Path,
+        dirty_summary: mock.MagicMock,
+    ) -> None:
+        """TrackerNotFoundError + dirty workspace → state dropped AND workspace removed."""
+        ws_root = tmp_path / "workspaces"
+        ws_dir = ws_root / "TEAM-1"
+        ws_dir.mkdir(parents=True)
+        (ws_dir / "sentinel").write_text("x")
+
+        self._add_state(orchestrator, workspace_path=str(ws_dir))
+        dirty_summary.return_value = "2 uncommitted files."
+        linear.set_response("list_triggered_issues", [])
+        linear.set_response("get_issue", LinearNotFoundError("gone"))
 
         orchestrator._tick()
         time.sleep(0.2)

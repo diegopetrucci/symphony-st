@@ -90,12 +90,26 @@ shutting down, or the ticket is no longer triggered — see `_is_still_triggered
   bot identity; the daemon can run with the user's personal API token or a
   dedicated bot account — it doesn't care. The `bot_user_email` config field
   has been removed.
-- **State entry exists ⟺ workspace exists.** `orchestrator._tick` step 3
-  fires cleanup (cancel subprocesses, remove state entry, remove workspace)
+- **State entry exists ⟹ workspace exists (not the reverse).** `orchestrator._tick`
+  step 3 fires cleanup (cancel subprocesses, remove state entry, remove workspace)
   whenever a tracked ticket is no longer *triggered* — i.e. the trigger label
   is absent, the Linear state is no longer an active state, the ticket is
-  archived, or the ticket was deleted. A re-trigger of the same ticket after
-  cleanup is handled as a fresh `_new_ticket_pipeline` that reclones from scratch.
+  archived, or the ticket was deleted. **Dirty workspaces are never deleted
+  without a second move.** On the first cleanup of a dirty workspace (per
+  `workspace.dirty_summary`), the daemon refuses: it posts a comment, transitions
+  the ticket back to Needs Input, and sets `TicketState.cleanup_refused_state`
+  to the workflow state the ticket was left in (Needs Input if the transition
+  succeeded, the state it was already in if it failed). A later cleanup deletes
+  (rmtree) only when the ticket has moved away from that recorded state; if the
+  ticket is still in it — human never moved it again, or the refusal transition
+  failed — the state entry is dropped but the dirty directory is kept, so a
+  workspace may exist with no state entry, and a re-triggered ticket then
+  reuses that directory via `clone_workspace`'s fetch-or-reuse path. Ticket
+  deletion is the exception: the `TrackerNotFoundError` branch cleans up
+  unconditionally, dirty or not. `cleanup_refused_state` is cleared
+  (set to `None`) when the agent next takes a turn (the pipelines do this
+  alongside `TicketStatus.working`), so new work re-arms the guard. A re-trigger
+  of the same ticket after cleanup is handled as a fresh `_new_ticket_pipeline`.
 - **Path containment is a security invariant.** `workspace._check_containment`
   uses `os.path.realpath` on both sides; never bypass it.
 - **State writes are atomic** (`tempfile` + `os.replace`). Don't rewrite

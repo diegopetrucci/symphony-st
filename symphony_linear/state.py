@@ -74,6 +74,12 @@ class TicketState(BaseModel):
     setup_error: str | None = Field(
         None, description="Non-null when a setup step failed; prevents re-spam"
     )
+    cleanup_refused_state: str | None = Field(
+        None,
+        description="Non-None when step-3 cleanup was refused because the workspace "
+        "is dirty; the workflow state the ticket was in immediately after our "
+        "refusal. Cleared (set to None) when the agent next takes a turn",
+    )
     attachment_count: int = Field(
         0, description="Number of attachment files written so far for this ticket"
     )

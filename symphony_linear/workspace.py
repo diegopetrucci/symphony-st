@@ -75,6 +75,16 @@ def _sanitize_identifier(identifier: str) -> str:
     return _VALID_CHARS_RE.sub("_", identifier)
 
 
+def compute_workspace_path(ticket_identifier: str, workspace_root: str) -> str:
+    """Return the workspace directory path for *ticket_identifier*.
+
+    The path is ``<workspace_root>/<sanitized_identifier>/``.
+    This function does **not** create the directory or check containment.
+    """
+    workspace_key = _sanitize_identifier(ticket_identifier)
+    return os.path.join(workspace_root, workspace_key)
+
+
 def compute_attachments_path(ticket_identifier: str, workspace_root: str) -> str:
     """Return the per-ticket attachments directory path.
 
@@ -356,52 +366,89 @@ def _git_switch_branch(
     logger.debug("Created and switched to new branch '%s'", branch_name)
 
 
-def _workspace_is_clean(workspace_path: str) -> bool:
-    """Check if a git workspace is clean (no dirty files or local-only commits).
+def _git_failure_summary(command: str, stderr: str) -> str:
+    """Build a short dirty summary for a failed *command*.
 
-    Returns ``True`` only if:
-
-    * ``git status --porcelain`` is empty — no modified or untracked files; and
-    * ``git rev-list HEAD --not --remotes`` is empty — no local-only commits
-      that haven't been pushed to any remote.
-
-    If any git command fails (e.g. corrupt repo), this function conservatively
-    returns ``False`` so we err on the side of preserving work.
+    Kept small — the summary is destined for a tracker comment.
     """
-    # Check 1: working tree and index are clean.
+    stderr_tail = stderr.strip().splitlines()
+    tail = "\n".join(stderr_tail[-3:]) if stderr_tail else "(no stderr)"
+    return f"Could not verify workspace state (`{command}` failed): {tail}"
+
+
+def dirty_summary(path: str) -> str | None:
+    """Return a short Markdown summary of uncommitted work at *path*.
+
+    Returns ``None`` when there is nothing to protect: *path* is not a
+    directory, or the workspace is clean — ``git status --porcelain`` is
+    empty **and** ``git rev-list --branches --not --remotes`` is empty (no
+    local-only commits that aren't mirrored on any remote).
+
+    Otherwise returns a short human-readable summary suitable for a tracker
+    comment: counts of uncommitted files and commits not on any remote, plus
+    up to 10 ``git status --porcelain`` lines in a fenced block.
+
+    If any git command fails or raises (e.g. the path is not a repository),
+    the workspace is treated as dirty and the summary says so — conservative,
+    since the caller can decide to override.
+    """
+    if not os.path.isdir(path):
+        return None
+
+    # Check 1: working tree and index.  Pass --untracked-files=normal
+    # explicitly so a status.showUntrackedFiles=no config (repo or global)
+    # cannot hide untracked work — a false "clean" would let the workspace
+    # be deleted.
     try:
         result = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=workspace_path,
+            ["git", "status", "--porcelain", "--untracked-files=normal"],
+            cwd=path,
             capture_output=True,
             text=True,
         )
-    except Exception:
-        logger.debug("git status failed during cleanliness check", exc_info=True)
-        return False
-    if result.returncode != 0 or result.stdout.strip():
-        return False
+    except Exception as exc:
+        logger.debug("git status failed during dirtiness check", exc_info=True)
+        return f"Could not verify workspace state (`git status` errored: {exc})."
+    if result.returncode != 0:
+        return _git_failure_summary("git status", result.stderr)
+    dirty_files = [line for line in result.stdout.splitlines() if line.strip()]
 
-    # Check 2: no local-only commits.  Compare HEAD against ALL remote-tracking
-    # refs (--not --remotes), not just the current branch's upstream (@{u}).
-    # The agent often commits to a per-ticket branch that may have no upstream
-    # set yet, and in no-push configurations the only copy of the agent's work
-    # is local — so we have to consider every remote ref to know whether HEAD's
-    # history is safely mirrored anywhere.
+    # Check 2: local-only commits.  Check ALL local branches (--branches),
+    # not just HEAD — the agent may have committed to a side branch while
+    # HEAD sits on a remote-backed branch, and those commits would be the
+    # only copy of the work.  Compare against ALL remote-tracking refs
+    # (--not --remotes), not just the current branch's upstream (@{u}).
+    # No --tags: a tag on a commit no remote branch holds is deliberate
+    # release tooling, not unmirrored work.  In no-push setups local-only
+    # commits are the only copy of the agent's work, so every local branch
+    # must be considered before we call the workspace clean.
     try:
         result = subprocess.run(
-            ["git", "rev-list", "HEAD", "--not", "--remotes"],
-            cwd=workspace_path,
+            ["git", "rev-list", "--branches", "--not", "--remotes"],
+            cwd=path,
             capture_output=True,
             text=True,
         )
-    except Exception:
-        logger.debug("git rev-list failed during cleanliness check", exc_info=True)
-        return False
-    if result.returncode != 0 or result.stdout.strip():
-        return False
+    except Exception as exc:
+        logger.debug("git rev-list failed during dirtiness check", exc_info=True)
+        return f"Could not verify workspace state (`git rev-list` errored: {exc})."
+    if result.returncode != 0:
+        return _git_failure_summary("git rev-list", result.stderr)
+    unpushed_commits = [line for line in result.stdout.splitlines() if line.strip()]
 
-    return True
+    if not dirty_files and not unpushed_commits:
+        return None
+
+    n_files = len(dirty_files)
+    n_commits = len(unpushed_commits)
+    summary = (
+        f"{n_files} uncommitted file{'' if n_files == 1 else 's'}, "
+        f"{n_commits} commit{'' if n_commits == 1 else 's'} not on any remote."
+    )
+    if dirty_files:
+        block = "\n".join(dirty_files[:10])
+        summary += f"\n\n```text\n{block}\n```"
+    return summary
 
 
 def clone_workspace(
@@ -411,11 +458,11 @@ def clone_workspace(
 ) -> tuple[str, bool]:
     """Clone or fetch the repository for *ticket_identifier*.
 
-    1. Sanitize the identifier to a safe directory name.
-    2. Compute the workspace path and verify it is within *workspace_root*.
-    3. Clone the repository if the directory does not already exist, otherwise
+    1. Compute the workspace path (sanitizing the identifier) and verify it is
+       within *workspace_root*.
+    2. Clone the repository if the directory does not already exist, otherwise
        fetch to pick up new remote branches.
-    4. On fetch failure: if the workspace is clean, nuke and re-clone from
+    3. On fetch failure: if the workspace is clean, nuke and re-clone from
        scratch (no exception).  If it has local state to preserve, log a
        warning and return normally (no exception).
 
@@ -438,11 +485,8 @@ def clone_workspace(
             *workspace_root*.
         CloneFailed: If ``git clone`` fails (initial clone or re-clone).
     """
-    # 1. Sanitize identifier → workspace_key
-    workspace_key = _sanitize_identifier(ticket_identifier)
-
-    # 2. Compute and validate workspace path
-    workspace_path = os.path.join(workspace_root, workspace_key)
+    # 1. Compute and validate workspace path
+    workspace_path = compute_workspace_path(ticket_identifier, workspace_root)
     real_path = _check_containment(workspace_path, workspace_root)
 
     # 3. Clone if the workspace does not exist; refresh if it does.
@@ -469,7 +513,7 @@ def clone_workspace(
     tail = "\n".join(stderr_tail[-5:]) if stderr_tail else "(no stderr)"
     logger.debug("git fetch failed (rc=%d): %s", result.returncode, tail)
 
-    if _workspace_is_clean(real_path):
+    if dirty_summary(real_path) is None:
         logger.info(
             "Workspace %s is clean — nuking and re-cloning after fetch failure",
             real_path,
@@ -614,8 +658,7 @@ def remove(
     Raises:
         PathContainmentError: If the computed path escapes *workspace_root*.
     """
-    workspace_key = _sanitize_identifier(ticket_identifier)
-    workspace_path = os.path.join(workspace_root, workspace_key)
+    workspace_path = compute_workspace_path(ticket_identifier, workspace_root)
 
     # Verify containment before removing anything.
     _check_containment(workspace_path, workspace_root)

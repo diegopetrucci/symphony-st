@@ -218,7 +218,10 @@ one option, `on`.
 Untriggering or moving the issue out of an active Status causes Symphony
 to cancel any in-flight subprocesses, delete the workspace, and remove
 the issue from its internal state on the next poll tick — just like
-removing the trigger label on Linear.
+removing the trigger label on Linear. If the workspace has uncommitted
+or unpushed work, Symphony refuses to delete it: it posts a comment and
+moves the ticket back to Needs Input, and only deletes the workspace if
+you move the ticket out a second time (or once the workspace is clean).
 
 ### Multi-repo projects
 

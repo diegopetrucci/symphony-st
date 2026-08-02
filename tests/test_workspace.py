@@ -25,9 +25,9 @@ from symphony_linear.workspace import (
     _ATTACHMENTS_DIR,
     _check_containment,
     _sanitize_identifier,
-    _workspace_is_clean,
     clone_workspace,
     compute_attachments_path,
+    dirty_summary,
     ensure_attachments_dir,
     finalize_workspace,
     prepare,
@@ -840,15 +840,16 @@ class TestCloneWorkspace:
 
 
 # ---------------------------------------------------------------------------
-# Unit: _workspace_is_clean
+# Unit: dirty_summary
 # ---------------------------------------------------------------------------
 
 
-class TestWorkspaceIsClean:
-    """_workspace_is_clean detects dirty state in a git repo."""
+class TestDirtySummary:
+    """dirty_summary returns None when there is nothing to protect, and a
+    short Markdown summary otherwise."""
 
-    def test_clean_clone_is_clean(self, tmp_path: Path) -> None:
-        """A freshly-cloned repo with no modifications is clean."""
+    def test_clean_clone_returns_none(self, tmp_path: Path) -> None:
+        """A freshly-cloned repo with no modifications has nothing to protect."""
         _require_git()
 
         source_repo = tmp_path / "source"
@@ -862,10 +863,10 @@ class TestWorkspaceIsClean:
             check=True,
         )
 
-        assert _workspace_is_clean(str(workspace))
+        assert dirty_summary(str(workspace)) is None
 
-    def test_untracked_file_is_not_clean(self, tmp_path: Path) -> None:
-        """An untracked file makes the workspace dirty."""
+    def test_untracked_file_returns_summary(self, tmp_path: Path) -> None:
+        """An untracked file yields a summary with a count and the file name."""
         _require_git()
 
         source_repo = tmp_path / "source"
@@ -881,9 +882,12 @@ class TestWorkspaceIsClean:
 
         (workspace / "untracked.txt").write_text("hello")
 
-        assert not _workspace_is_clean(str(workspace))
+        summary = dirty_summary(str(workspace))
+        assert summary is not None
+        assert "1 uncommitted file," in summary
+        assert "untracked.txt" in summary
 
-    def test_modified_tracked_file_is_not_clean(self, tmp_path: Path) -> None:
+    def test_modified_tracked_file_returns_summary(self, tmp_path: Path) -> None:
         """A modified tracked file makes the workspace dirty."""
         _require_git()
 
@@ -900,9 +904,12 @@ class TestWorkspaceIsClean:
 
         (workspace / "README.md").write_text("modified content")
 
-        assert not _workspace_is_clean(str(workspace))
+        summary = dirty_summary(str(workspace))
+        assert summary is not None
+        assert "1 uncommitted file," in summary
+        assert "README.md" in summary
 
-    def test_local_only_commit_is_not_clean(self, tmp_path: Path) -> None:
+    def test_local_only_commit_returns_summary(self, tmp_path: Path) -> None:
         """A local commit that is not on any remote makes the workspace dirty."""
         _require_git()
 
@@ -933,7 +940,88 @@ class TestWorkspaceIsClean:
             cwd=workspace,
         )
 
-        assert not _workspace_is_clean(str(workspace))
+        summary = dirty_summary(str(workspace))
+        assert summary is not None
+        assert "1 commit not on any remote" in summary
+
+    def test_side_branch_commit_returns_summary(self, tmp_path: Path) -> None:
+        """A commit on a local side branch is dirty even when HEAD itself
+        sits clean on a remote-backed branch."""
+        _require_git()
+
+        source_repo = tmp_path / "source"
+        _make_source_repo(source_repo)
+
+        workspace = tmp_path / "ws"
+        subprocess.run(
+            ["git", "clone", str(source_repo), str(workspace)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+        # Commit on a side branch, then return HEAD to the remote-backed main.
+        _run_git(["checkout", "-b", "side-branch"], cwd=workspace)
+        (workspace / "side.txt").write_text("side work")
+        _run_git(["add", "side.txt"], cwd=workspace)
+        _run_git(
+            [
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "side commit",
+            ],
+            cwd=workspace,
+        )
+        _run_git(["checkout", "main"], cwd=workspace)
+
+        summary = dirty_summary(str(workspace))
+        assert summary is not None
+        assert "1 commit not on any remote" in summary
+
+    def test_untracked_file_dirty_with_showuntrackedfiles_no(
+        self, tmp_path: Path
+    ) -> None:
+        """status.showUntrackedFiles=no in the repo config must not hide
+        untracked work."""
+        _require_git()
+
+        source_repo = tmp_path / "source"
+        _make_source_repo(source_repo)
+
+        workspace = tmp_path / "ws"
+        subprocess.run(
+            ["git", "clone", str(source_repo), str(workspace)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+        # A repo-local config that would hide untracked files from a plain
+        # `git status --porcelain` unless explicitly overridden.
+        _run_git(["config", "status.showUntrackedFiles", "no"], cwd=workspace)
+
+        (workspace / "untracked.txt").write_text("hello")
+
+        summary = dirty_summary(str(workspace))
+        assert summary is not None
+        assert "untracked.txt" in summary
+
+    def test_missing_directory_returns_none(self, tmp_path: Path) -> None:
+        """A path that is not a directory has nothing to protect."""
+        assert dirty_summary(str(tmp_path / "does-not-exist")) is None
+
+    def test_non_repo_directory_returns_summary(self, tmp_path: Path) -> None:
+        """A directory that is not a git repo is conservatively dirty."""
+        plain = tmp_path / "plain"
+        plain.mkdir()
+
+        summary = dirty_summary(str(plain))
+        assert summary is not None
+        assert "Could not verify workspace state" in summary
 
 
 # ---------------------------------------------------------------------------
