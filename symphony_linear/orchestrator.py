@@ -302,7 +302,13 @@ class Orchestrator:
             logger.debug("Poll tick starting")
             issues = self._fetch_triggered_issues()
 
-            # --- Step 2: new tickets + setup-error / failed-no-session retries ---
+            # Tickets that already had a pipeline scheduled this tick.  Step 4
+            # must not schedule a second pipeline for the same ticket in the
+            # same tick: _schedule_task dedup only skips in-flight tasks, so a
+            # fast pipeline could otherwise run twice and post two comments.
+            scheduled_this_tick: set[str] = set()
+
+            # --- Step 2: new tickets + setup-error retries ---
             for issue in issues:
                 # Skip any pipeline scheduling while the ticket is in QA — the serve
                 # handles it; the agent should not run concurrently.
@@ -317,11 +323,13 @@ class Orchestrator:
                 if existing is not None:
                     # Retry setup-error tickets if user commented.
                     if existing.setup_error is not None:
-                        if self._has_new_human_comment(
+                        pending = self._pending_human_comments(
                             issue.id, existing.last_seen_comment_id
-                        ):
+                        )
+                        if pending is not None:
                             logger.info(
-                                "User commented on setup-error %s – retrying", issue.id
+                                "User commented on setup-error %s – retrying",
+                                issue.id,
                             )
                             with self._state_lock:
                                 existing.setup_error = None
@@ -330,31 +338,20 @@ class Orchestrator:
                                 self._state.save()
                             # Route to resume if the existing state already has a
                             # session (e.g. ProjectConfigError fired during a resume
-                            # turn).  Otherwise start a fresh initial pipeline.
+                            # turn).  Otherwise start a fresh initial pipeline,
+                            # carrying the pending comment into the prompt.
                             if existing.session_id:
                                 self._schedule_task(
                                     issue.id, self._resume_pipeline, existing
                                 )
                             else:
                                 self._schedule_task(
-                                    issue.id, self._new_ticket_pipeline, issue
+                                    issue.id,
+                                    self._new_ticket_pipeline,
+                                    issue,
+                                    pending,
                                 )
-                    # Retry failed-no-session tickets if user commented (B1).
-                    elif (
-                        existing.status == TicketStatus.failed
-                        and existing.session_id is None
-                        and existing.setup_error is None
-                    ):
-                        if self._has_new_human_comment(
-                            issue.id, existing.last_seen_comment_id
-                        ):
-                            logger.info(
-                                "User commented on failed-no-session %s – retrying initial",
-                                issue.id,
-                            )
-                            self._schedule_task(
-                                issue.id, self._new_ticket_pipeline, issue
-                            )
+                            scheduled_this_tick.add(issue.id)
                     continue  # known ticket
 
                 # Genuinely new ticket.
@@ -552,6 +549,12 @@ class Orchestrator:
                 tid = ticket_state.ticket_id
                 st = ticket_state.status
 
+                # Step 2 already scheduled a pipeline for this ticket this tick
+                # (e.g. a setup-error retry): skip it so no ticket can get two
+                # pipelines scheduled in one tick.
+                if tid in scheduled_this_tick:
+                    continue
+
                 # _resume_pipeline handles its own early-return when there are no new
                 # human comments, so QA tickets naturally fall through here — only
                 # tickets with actual new human comments will get an agent turn.
@@ -567,12 +570,29 @@ class Orchestrator:
                         logger.debug("Skipping recovery for working QA ticket %s", tid)
                         continue
                     self._schedule_task(tid, self._recover_working_ticket, ticket_state)
-                elif st == TicketStatus.needs_input:
-                    self._schedule_task(tid, self._resume_pipeline, ticket_state)
-                elif st == TicketStatus.failed:
+                elif st in (TicketStatus.needs_input, TicketStatus.failed):
                     if ticket_state.session_id:
                         self._schedule_task(tid, self._resume_pipeline, ticket_state)
-                    # no-session + no setup_error: handled in step 2 (gated on new comment)
+                    else:
+                        # No session and no setup_error (failed + setup_error is
+                        # skipped above): run the full initial turn so the agent
+                        # gets the ticket title/description instead of resuming
+                        # an empty session.  Gate on a new human comment, the
+                        # same gate _resume_pipeline applies, so a turn never
+                        # starts out of nowhere.  Tickets not in the trigger
+                        # list (e.g. cleanup-refused ones) are left alone.
+                        tracked_issue = issues_by_id.get(tid)
+                        if tracked_issue is not None:
+                            pending = self._pending_human_comments(
+                                tid, ticket_state.last_seen_comment_id
+                            )
+                            if pending is not None:
+                                self._schedule_task(
+                                    tid,
+                                    self._new_ticket_pipeline,
+                                    tracked_issue,
+                                    pending,
+                                )
 
     # ==================================================================
     # QA serve reconciliation
@@ -979,7 +999,14 @@ class Orchestrator:
     # New-ticket pipeline
     # ==================================================================
 
-    def _new_ticket_pipeline(self, issue: Issue) -> None:
+    def _new_ticket_pipeline(
+        self, issue: Issue, extra_context: str | None = None
+    ) -> None:
+        """Run a full initial turn for *issue*.
+
+        *extra_context* is optional pre-formatted text (e.g. pending human
+        comments that triggered a rerun) appended to the initial prompt.
+        """
         tid = issue.id
         logger.info("New ticket pipeline starting for %s (%s)", tid, issue.identifier)
         if self._is_cancelled(tid):
@@ -1003,6 +1030,11 @@ class Orchestrator:
 
         # --- Save bootstrapping state EARLY (B2) ---
         # Branch is computed after loading project config; use "" as placeholder.
+        # Preserve the previous last_seen_comment_id: this pipeline also runs on
+        # the retry route (failed-no-session after a user comment).  Wiping it
+        # here would make the next _pending_human_comments call return the whole
+        # comment history again and re-run the initial pipeline every tick.
+        previous_state = self._state.get(tid)
         ticket_state = TicketState(
             ticket_id=tid,
             ticket_identifier=issue.identifier,
@@ -1010,6 +1042,9 @@ class Orchestrator:
             repo_url=repo_url,
             workspace_path="",  # not yet known
             branch="",  # will be updated after loading project config
+            last_seen_comment_id=(
+                previous_state.last_seen_comment_id if previous_state else None
+            ),
             status=TicketStatus.bootstrapping,
         )
         with self._state_lock:
@@ -1225,6 +1260,12 @@ class Orchestrator:
                 self._state.save()
 
         prompt = _build_initial_prompt(issue.title, rewritten_description)
+        # NOTE: extra_context (pending human comments) is appended as plain
+        # text.  Attachment processing above only ran against the ticket
+        # description, so any attachments in the continuation comments are
+        # not downloaded or passed to run_initial here.  Accepted limitation.
+        if extra_context:
+            prompt += f"\n\n---\n\n{extra_context}"
 
         if self._is_cancelled(tid):
             return
@@ -1494,7 +1535,7 @@ class Orchestrator:
         try:
             final_message, _context_tokens = run_resume(
                 workspace_path=ticket_state.workspace_path,
-                session_id=ticket_state.session_id or "",
+                session_id=ticket_state.session_id,
                 message=rewritten_message,
                 timeout_seconds=effective_turn_timeout,
                 on_subprocess=lambda proc: (self._register_subprocess(tid, proc), None)[
@@ -1689,13 +1730,24 @@ class Orchestrator:
             )
         return None
 
-    def _has_new_human_comment(self, issue_id: str, last_seen: str | None) -> bool:
+    def _pending_human_comments(
+        self, issue_id: str, last_seen: str | None
+    ) -> str | None:
+        """Return formatted new human comments since *last_seen*, or None.
+
+        Bot comments (``is_bot_comment``) are filtered out.  Returns None
+        both when there are no new human comments and when the tracker call
+        fails, so callers can gate a turn on the result directly.
+        """
         try:
             comments = self._tracker.list_comments_since(issue_id, last_seen)
         except Exception:
             logger.exception("Failed to list comments for %s", issue_id)
-            return False
-        return any(not is_bot_comment(c.body) for c in comments)
+            return None
+        human_comments = [c for c in comments if not is_bot_comment(c.body)]
+        if not human_comments:
+            return None
+        return _format_comments_message(human_comments)
 
     # ==================================================================
     # Signal handling and shutdown

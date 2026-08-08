@@ -245,7 +245,7 @@ def run_initial(
 
 def run_resume(
     workspace_path: str,
-    session_id: str,
+    session_id: str | None,
     message: str,
     *,
     timeout_seconds: int,
@@ -262,7 +262,9 @@ def run_resume(
 
     Args:
         workspace_path: Path to the workspace directory (host side).
-        session_id: The OpenCode session identifier to resume.
+        session_id: The OpenCode session identifier to resume. Must be a
+            non-empty string: an empty session id would make OpenCode start
+            a fresh session, and the agent would lose all ticket context.
         message: The follow-up message to send.
         timeout_seconds: Maximum seconds before raising
             :class:`OpenCodeTimeout`.
@@ -282,10 +284,16 @@ def run_resume(
         is ``int`` or ``None``.
 
     Raises:
-        OpenCodeError: The subprocess exited with a non-zero code.
+        OpenCodeError: The subprocess exited with a non-zero code, or
+            *session_id* was empty.
         OpenCodeTimeout: The turn exceeded *timeout_seconds*.
         OpenCodeCancelled: The process was killed externally.
     """
+    if not session_id:
+        raise OpenCodeError(
+            "run_resume requires a non-empty session_id; refusing to launch "
+            "an empty OpenCode session"
+        )
     cmd: list[str] = [
         "opencode",
         "run",

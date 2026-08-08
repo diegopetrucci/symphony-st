@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from symphony_linear.opencode import (
+    OpenCodeError,
     OpenCodeTimeout,
     _assemble_message,
     _extract_context_tokens,
@@ -726,6 +727,26 @@ class TestFilesArgv:
         file_idx = cmd.index("--file")
         sep_idx = cmd.index("--")
         assert file_idx < sep_idx
+
+
+# ---------------------------------------------------------------------------
+# Unit: empty-session guard
+# ---------------------------------------------------------------------------
+
+
+class TestRunResumeGuard:
+    """run_resume must refuse to launch an empty OpenCode session."""
+
+    @pytest.mark.parametrize("session_id", ["", None])
+    def test_empty_session_id_raises(self, session_id: str | None) -> None:
+        with pytest.raises(OpenCodeError, match="non-empty session_id"):
+            run_resume(
+                workspace_path="/ws",
+                session_id=session_id,
+                message="continue",
+                timeout_seconds=60,
+                on_subprocess=lambda p: None,
+            )
 
 
 # ---------------------------------------------------------------------------

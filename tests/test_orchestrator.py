@@ -332,6 +332,64 @@ class TestNewTicketPipeline:
         assert ts.setup_error is not None
         assert ts.last_seen_comment_id is not None
 
+    def test_rerun_preserves_existing_last_seen_comment_id(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """A re-run of _new_ticket_pipeline keeps the existing last_seen_comment_id.
+
+        The bootstrapping upsert must not wipe the pointer: if it did, a
+        failed retry turn whose error comment also failed to post would leave
+        last_seen_comment_id None, and the next tick would treat the whole
+        comment history as pending and re-run the initial pipeline every tick.
+        """
+        from symphony_linear.workspace import CloneFailed
+
+        # Pre-existing state entry with a known comment pointer (retry route).
+        existing = TicketState(
+            ticket_id="ticket-1",
+            ticket_identifier="TEAM-1",
+            project_id="proj-1",
+            repo_url="https://github.com/org/repo.git",
+            workspace_path="/tmp/ws/TEAM-1",
+            branch="feature/test",
+            status=TicketStatus.failed,
+            last_seen_comment_id="cmt-prior",
+        )
+        orchestrator._state.upsert(existing)
+        orchestrator._state.save()
+
+        linear.set_response(
+            "get_project",
+            Project(
+                id="proj-1",
+                name="Test",
+                links=[
+                    ProjectLink(label="Repo", url="https://github.com/org/repo.git")
+                ],
+            ),
+        )
+        # If the pointer were wiped, baselining would pick this up instead.
+        linear.set_response(
+            "list_comments_since", [_make_comment("cmt-history-1", "Hello")]
+        )
+        # Error-comment post fails, so _save_setup_error must reuse the
+        # existing pointer rather than fall back to baselining.
+        linear.set_response("post_comment", LinearError("api down"))
+
+        with mock.patch(
+            "symphony_linear.orchestrator.clone_workspace",
+            side_effect=CloneFailed("fail"),
+        ):
+            orchestrator._new_ticket_pipeline(_make_issue())
+
+        ts = orchestrator._state.get("ticket-1")
+        assert ts is not None
+        assert ts.status == TicketStatus.failed
+        assert ts.setup_error is not None
+        # Pointer survived the bootstrapping upsert — not the baselined fallback.
+        assert ts.last_seen_comment_id == "cmt-prior"
+        assert linear.calls.get("list_comments_since") is None
+
     def test_opencode_timeout_advances_last_seen(
         self, orchestrator: Orchestrator, linear: FakeLinearClient
     ) -> None:
@@ -1449,7 +1507,6 @@ class TestResumePipeline:
     def test_bot_comments_filtered(
         self, orchestrator: Orchestrator, linear: FakeLinearClient
     ) -> None:
-
         ts = self._make_ts()
         orchestrator._state.upsert(ts)
         linear.set_response(
@@ -2361,9 +2418,9 @@ class TestTick:
             orchestrator._tick()
             time.sleep(0.2)
         m_new.assert_not_called()
-        # _resume_pipeline may be called twice (step 2 setup-error retry + step 4
-        # failed-with-session scheduling), but must be called at least once.
-        assert m_resume.call_count >= 1
+        # Step 2 retries the setup error and records the ticket, so step 4 must
+        # not schedule a second resume for the same ticket in the same tick.
+        m_resume.assert_called_once()
         # The state passed to _resume_pipeline must have session_id preserved.
         ts_passed = m_resume.call_args[0][0]
         assert ts_passed.session_id == "ses-abc"
@@ -2371,7 +2428,8 @@ class TestTick:
     def test_failed_no_session_retried_on_comment(
         self, orchestrator: Orchestrator, linear: FakeLinearClient
     ) -> None:
-        """B1: failed + no session_id + human comment → retry initial pipeline."""
+        """Step 4: failed + no session_id + human comment → initial pipeline
+        carrying the pending comment."""
         self._add_state(
             orchestrator,
             status=TicketStatus.failed,
@@ -2384,13 +2442,18 @@ class TestTick:
             orchestrator._tick()
             time.sleep(0.2)
         m.assert_called_once()
+        # The pending human comment must reach the pipeline so it lands in the
+        # initial prompt (prompt assembly is covered end-to-end by
+        # test_needs_input_no_session_reruns_initial_with_comment).
+        pending = m.call_args[0][1]
+        assert "try again" in pending
 
     def test_failed_no_session_skipped_without_comment(
         self,
         orchestrator: Orchestrator,
         linear: FakeLinearClient,
     ) -> None:
-        """B1: failed + no session + no new comment → skip, don't retry."""
+        """Step 4: failed + no session + no new comment → no turn."""
         self._add_state(
             orchestrator,
             status=TicketStatus.failed,
@@ -2417,6 +2480,95 @@ class TestTick:
             orchestrator._tick()
             time.sleep(0.2)
         m.assert_called_once()
+
+    # --- Step-4 routing: no session id ⟹ initial turn, never resume ---
+
+    def test_needs_input_no_session_reruns_initial_with_comment(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """needs_input + session_id None + new human comment → full initial turn
+        whose prompt includes the ticket and the pending comment; no resume."""
+        self._add_state(
+            orchestrator,
+            status=TicketStatus.needs_input,
+            session_id=None,
+            last_seen_comment_id="cmt-old",
+        )
+        issue = _make_issue(description="Fix the bug")
+        linear.set_response("list_triggered_issues", [issue])
+        linear.set_response(
+            "list_comments_since", [_make_comment("c1", "please continue")]
+        )
+        linear.set_response("get_issue", issue)  # description fetch
+        linear.set_response(
+            "get_project",
+            Project(
+                id="proj-1",
+                name="Test",
+                links=[
+                    ProjectLink(label="Repo", url="https://github.com/org/repo.git")
+                ],
+            ),
+        )
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.clone_workspace",
+                return_value=("/tmp/ws/TEAM-1", False),
+            ),
+            mock.patch("symphony_linear.orchestrator.finalize_workspace"),
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config",
+                return_value=ProjectConfig(),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.run_initial",
+                return_value=("ses-new", "Done.", None),
+            ) as m_initial,
+            mock.patch("symphony_linear.orchestrator.run_resume") as m_resume,
+        ):
+            orchestrator._tick()
+            time.sleep(0.2)
+        m_resume.assert_not_called()
+        m_initial.assert_called_once()
+        prompt = m_initial.call_args.kwargs["prompt"]
+        assert "Fix the bug" in prompt  # ticket description
+        assert "please continue" in prompt  # pending human comment
+
+    def test_needs_input_with_session_schedules_resume(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """needs_input + session_id set → resume as before (no initial rerun)."""
+        self._add_state(orchestrator, status=TicketStatus.needs_input)
+        linear.set_response("list_triggered_issues", [_make_issue()])
+        with (
+            mock.patch.object(orchestrator, "_new_ticket_pipeline") as m_new,
+            mock.patch.object(orchestrator, "_resume_pipeline") as m_resume,
+        ):
+            orchestrator._tick()
+            time.sleep(0.2)
+        m_new.assert_not_called()
+        m_resume.assert_called_once()
+
+    def test_needs_input_no_session_without_comment_no_turn(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """needs_input + session_id None + no new human comment → no turn."""
+        self._add_state(
+            orchestrator,
+            status=TicketStatus.needs_input,
+            session_id=None,
+            last_seen_comment_id="cmt-old",
+        )
+        linear.set_response("list_triggered_issues", [_make_issue()])
+        linear.set_response("list_comments_since", [])
+        with (
+            mock.patch.object(orchestrator, "_new_ticket_pipeline") as m_new,
+            mock.patch.object(orchestrator, "_resume_pipeline") as m_resume,
+        ):
+            orchestrator._tick()
+            time.sleep(0.2)
+        m_new.assert_not_called()
+        m_resume.assert_not_called()
 
     def test_deleted_ticket_removes_workspace(
         self,
