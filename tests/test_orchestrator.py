@@ -2578,7 +2578,7 @@ class TestTick:
     ) -> None:
         """Ticket gone from Linear (404) → state removed AND workspace removed."""
         ws_root = tmp_path / "workspaces"
-        ws_dir = ws_root / "TEAM-1"
+        ws_dir = ws_root / "TEAM-1" / "repo"
         ws_dir.mkdir(parents=True)
         (ws_dir / "sentinel").write_text("x")
 
@@ -2600,7 +2600,7 @@ class TestTick:
     ) -> None:
         """Trigger label removed → workspace AND state entry deleted."""
         ws_root = tmp_path / "workspaces"
-        ws_dir = ws_root / "TEAM-1"
+        ws_dir = ws_root / "TEAM-1" / "repo"
         ws_dir.mkdir(parents=True)
         (ws_dir / "sentinel").write_text("x")
 
@@ -2623,7 +2623,7 @@ class TestTick:
     ) -> None:
         """Archived ticket → state removed AND workspace removed."""
         ws_root = tmp_path / "workspaces"
-        ws_dir = ws_root / "TEAM-1"
+        ws_dir = ws_root / "TEAM-1" / "repo"
         ws_dir.mkdir(parents=True)
         (ws_dir / "sentinel").write_text("x")
 
@@ -2650,7 +2650,7 @@ class TestTick:
     ) -> None:
         """Ticket in non-active, non-terminal state (Backlog) with label still on → cleanup."""
         ws_root = tmp_path / "workspaces"
-        ws_dir = ws_root / "TEAM-1"
+        ws_dir = ws_root / "TEAM-1" / "repo"
         ws_dir.mkdir(parents=True)
         (ws_dir / "sentinel").write_text("x")
 
@@ -2678,7 +2678,7 @@ class TestTick:
     ) -> None:
         """Ticket in terminal state (Done) → state removed AND workspace removed."""
         ws_root = tmp_path / "workspaces"
-        ws_dir = ws_root / "TEAM-1"
+        ws_dir = ws_root / "TEAM-1" / "repo"
         ws_dir.mkdir(parents=True)
         (ws_dir / "sentinel").write_text("x")
 
@@ -2709,7 +2709,7 @@ class TestTick:
     ) -> None:
         """Dirty workspace + first cleanup → no rmtree, comment posted, transitioned, state recorded."""
         ws_root = tmp_path / "workspaces"
-        ws_dir = ws_root / "TEAM-1"
+        ws_dir = ws_root / "TEAM-1" / "repo"
         ws_dir.mkdir(parents=True)
         (ws_dir / "sentinel").write_text("x")
 
@@ -2749,7 +2749,7 @@ class TestTick:
     ) -> None:
         """Dirty + refusal recorded + issue still in needs_input → state dropped, dir kept, notice posted."""
         ws_root = tmp_path / "workspaces"
-        ws_dir = ws_root / "TEAM-1"
+        ws_dir = ws_root / "TEAM-1" / "repo"
         ws_dir.mkdir(parents=True)
         (ws_dir / "sentinel").write_text("x")
 
@@ -2784,7 +2784,7 @@ class TestTick:
     ) -> None:
         """Refusal transition fails → state records the current state; second pass keeps dir."""
         ws_root = tmp_path / "workspaces"
-        ws_dir = ws_root / "TEAM-1"
+        ws_dir = ws_root / "TEAM-1" / "repo"
         ws_dir.mkdir(parents=True)
         (ws_dir / "sentinel").write_text("x")
 
@@ -2819,7 +2819,7 @@ class TestTick:
         """State entry with workspace_path='' → dirtiness is checked on the
         identifier-derived directory, which then refuses deletion."""
         ws_root = tmp_path / "workspaces"
-        ws_dir = ws_root / "TEAM-1"
+        ws_dir = ws_root / "TEAM-1" / "repo"
         ws_dir.mkdir(parents=True)
         (ws_dir / "sentinel").write_text("x")
 
@@ -2850,7 +2850,7 @@ class TestTick:
     ) -> None:
         """Dirty + refusal recorded + issue moved elsewhere → full cleanup with rmtree."""
         ws_root = tmp_path / "workspaces"
-        ws_dir = ws_root / "TEAM-1"
+        ws_dir = ws_root / "TEAM-1" / "repo"
         ws_dir.mkdir(parents=True)
         (ws_dir / "sentinel").write_text("x")
 
@@ -2885,7 +2885,7 @@ class TestTick:
     ) -> None:
         """A failed delete-receipt post does not stop the rmtree cleanup."""
         ws_root = tmp_path / "workspaces"
-        ws_dir = ws_root / "TEAM-1"
+        ws_dir = ws_root / "TEAM-1" / "repo"
         ws_dir.mkdir(parents=True)
         (ws_dir / "sentinel").write_text("x")
 
@@ -2914,7 +2914,7 @@ class TestTick:
     ) -> None:
         """A failed stop-tracking notice does not stop dropping the state entry."""
         ws_root = tmp_path / "workspaces"
-        ws_dir = ws_root / "TEAM-1"
+        ws_dir = ws_root / "TEAM-1" / "repo"
         ws_dir.mkdir(parents=True)
         (ws_dir / "sentinel").write_text("x")
 
@@ -2943,7 +2943,7 @@ class TestTick:
     ) -> None:
         """Clean workspace → state entry and workspace removed, even with refusal recorded."""
         ws_root = tmp_path / "workspaces"
-        ws_dir = ws_root / "TEAM-1"
+        ws_dir = ws_root / "TEAM-1" / "repo"
         ws_dir.mkdir(parents=True)
         (ws_dir / "sentinel").write_text("x")
 
@@ -2971,7 +2971,7 @@ class TestTick:
     ) -> None:
         """TrackerNotFoundError + dirty workspace → state dropped AND workspace removed."""
         ws_root = tmp_path / "workspaces"
-        ws_dir = ws_root / "TEAM-1"
+        ws_dir = ws_root / "TEAM-1" / "repo"
         ws_dir.mkdir(parents=True)
         (ws_dir / "sentinel").write_text("x")
 
@@ -3073,7 +3073,7 @@ class TestTick:
         """Ticket in qa_state is tracked and not cleaned up when qa_state is configured."""
         config = _make_config(tmp_path, linear={"qa_state": "In Review"})
         ws_root = tmp_path / "workspaces"
-        ws_dir = ws_root / "TEAM-1"
+        ws_dir = ws_root / "TEAM-1" / "repo"
         ws_dir.mkdir(parents=True)
         (ws_dir / "sentinel").write_text("x")
 
@@ -3316,7 +3316,7 @@ class TestTick:
     ) -> None:
         """Untriggered ticket with session_id → snapshot saved to sessions map."""
         ws_root = tmp_path / "workspaces"
-        ws_dir = ws_root / "TEAM-1"
+        ws_dir = ws_root / "TEAM-1" / "repo"
         ws_dir.mkdir(parents=True)
         (ws_dir / "sentinel").write_text("x")
 
@@ -3348,7 +3348,7 @@ class TestTick:
     ) -> None:
         """Untriggered ticket without session_id → no session snapshot created."""
         ws_root = tmp_path / "workspaces"
-        ws_dir = ws_root / "TEAM-1"
+        ws_dir = ws_root / "TEAM-1" / "repo"
         ws_dir.mkdir(parents=True)
         (ws_dir / "sentinel").write_text("x")
 
@@ -3376,7 +3376,7 @@ class TestTick:
         from symphony_linear.state import SessionRecord
 
         ws_root = tmp_path / "workspaces"
-        ws_dir = ws_root / "TEAM-1"
+        ws_dir = ws_root / "TEAM-1" / "repo"
         ws_dir.mkdir(parents=True)
         (ws_dir / "sentinel").write_text("x")
 
@@ -3410,7 +3410,7 @@ class TestTick:
         from symphony_linear.state import SessionRecord
 
         ws_root = tmp_path / "workspaces"
-        ws_dir = ws_root / "TEAM-1"
+        ws_dir = ws_root / "TEAM-1" / "repo"
         ws_dir.mkdir(parents=True)
         (ws_dir / "sentinel").write_text("x")
 

@@ -43,7 +43,7 @@ class TestAttachmentsArgv:
                     workspace_path="/fake/workspace",
                     hide_paths=[],
                     env={"HOME": "/fake/home"},
-                    attachments_path="/fake/ws/.attachments/TEAM-42",
+                    attachments_path="/fake/ws/TEAM-42/attachments",
                 )
 
                 args = popen_mock.call_args[0][0]
@@ -58,7 +58,7 @@ class TestAttachmentsArgv:
                     ):
                         ro_bind_count += 1
                         # The path should be expanded (realpath resolved)
-                        assert args[i + 1] == "/fake/ws/.attachments/TEAM-42"
+                        assert args[i + 1] == "/fake/ws/TEAM-42/attachments"
                 assert ro_bind_count == 1, (
                     f"Expected exactly one --ro-bind ... /tmp/symphony-attachments in args: {args}"
                 )
@@ -78,7 +78,7 @@ class TestAttachmentsArgv:
                     workspace_path="/fake/workspace",
                     hide_paths=[],
                     env={"HOME": "/fake/home"},
-                    attachments_path="/fake/ws/.attachments/TEAM-42",
+                    attachments_path="/fake/ws/TEAM-42/attachments",
                 )
 
                 args = popen_mock.call_args[0][0]

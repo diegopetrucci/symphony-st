@@ -372,8 +372,8 @@ class Orchestrator:
 
                 # Derive the path from the identifier, not the state entry:
                 # the entry may carry an empty or stale workspace_path (e.g.
-                # while bootstrapping), but the dirtiness check and the delete
-                # must inspect the same directory.
+                # while bootstrapping).  The dirtiness check inspects the
+                # repo directory; remove() deletes the containing ticket dir.
                 workspace_path = compute_workspace_path(
                     ticket_state.ticket_identifier, str(self._workspace)
                 )

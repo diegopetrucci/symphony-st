@@ -32,8 +32,10 @@ SETUP_TIMEOUT_SECONDS = 300
 # Default branch name is derived from the ticket identifier (lowercased).
 _DEFAULT_BRANCH_PREFIX = "symphony/"
 
-# Subdirectory under workspace_root where per-ticket attachments live.
-_ATTACHMENTS_DIR = ".attachments"
+# Subdirectories inside each per-ticket directory.
+_REPO_DIR = "repo"
+_ATTACHMENTS_DIR = "attachments"
+_TMP_DIR = "tmp"
 
 
 # ---------------------------------------------------------------------------
@@ -75,24 +77,46 @@ def _sanitize_identifier(identifier: str) -> str:
     return _VALID_CHARS_RE.sub("_", identifier)
 
 
-def compute_workspace_path(ticket_identifier: str, workspace_root: str) -> str:
-    """Return the workspace directory path for *ticket_identifier*.
+def compute_ticket_dir(ticket_identifier: str, workspace_root: str) -> str:
+    """Return the per-ticket directory path for *ticket_identifier*.
 
-    The path is ``<workspace_root>/<sanitized_identifier>/``.
+    The path is ``<workspace_root>/<sanitized_identifier>/`` and holds all
+    per-ticket state (``repo/``, ``attachments/``, ``tmp/``).
     This function does **not** create the directory or check containment.
     """
     workspace_key = _sanitize_identifier(ticket_identifier)
     return os.path.join(workspace_root, workspace_key)
 
 
+def compute_workspace_path(ticket_identifier: str, workspace_root: str) -> str:
+    """Return the workspace (git clone) directory path for *ticket_identifier*.
+
+    The path is ``<workspace_root>/<sanitized_identifier>/repo/``.
+    This function does **not** create the directory or check containment.
+    """
+    return os.path.join(
+        compute_ticket_dir(ticket_identifier, workspace_root), _REPO_DIR
+    )
+
+
 def compute_attachments_path(ticket_identifier: str, workspace_root: str) -> str:
     """Return the per-ticket attachments directory path.
 
-    The path is ``<workspace_root>/.attachments/<sanitized_identifier>/``.
+    The path is ``<workspace_root>/<sanitized_identifier>/attachments/``.
     This function does **not** create the directory or check containment.
     """
-    workspace_key = _sanitize_identifier(ticket_identifier)
-    return os.path.join(workspace_root, _ATTACHMENTS_DIR, workspace_key)
+    return os.path.join(
+        compute_ticket_dir(ticket_identifier, workspace_root), _ATTACHMENTS_DIR
+    )
+
+
+def compute_tmp_path(ticket_identifier: str, workspace_root: str) -> str:
+    """Return the per-ticket tmp directory path.
+
+    The path is ``<workspace_root>/<sanitized_identifier>/tmp/``.
+    This function does **not** create the directory or check containment.
+    """
+    return os.path.join(compute_ticket_dir(ticket_identifier, workspace_root), _TMP_DIR)
 
 
 def ensure_attachments_dir(ticket_identifier: str, workspace_root: str) -> str:
@@ -112,6 +136,25 @@ def ensure_attachments_dir(ticket_identifier: str, workspace_root: str) -> str:
     _check_containment(attachments_dir, workspace_root)
     os.makedirs(attachments_dir, mode=0o700, exist_ok=True)
     return attachments_dir
+
+
+def ensure_tmp_dir(ticket_identifier: str, workspace_root: str) -> str:
+    """Create and return the per-ticket tmp directory, verified safe.
+
+    1. Computes the path via :func:`compute_tmp_path`.
+    2. Validates the path is contained within *workspace_root* (blocks symlink
+       escapes).
+    3. Creates the directory tree with mode ``0o700``.
+    4. Returns the validated host path.
+
+    Raises:
+        PathContainmentError: If the computed path is not within
+            *workspace_root* after realpath resolution.
+    """
+    tmp_dir = compute_tmp_path(ticket_identifier, workspace_root)
+    _check_containment(tmp_dir, workspace_root)
+    os.makedirs(tmp_dir, mode=0o700, exist_ok=True)
+    return tmp_dir
 
 
 def _check_containment(workspace_path: str, workspace_root: str) -> str:
@@ -458,13 +501,13 @@ def clone_workspace(
 ) -> tuple[str, bool]:
     """Clone or fetch the repository for *ticket_identifier*.
 
-    1. Compute the workspace path (sanitizing the identifier) and verify it is
-       within *workspace_root*.
-    2. Clone the repository if the directory does not already exist, otherwise
-       fetch to pick up new remote branches.
-    3. On fetch failure: if the workspace is clean, nuke and re-clone from
-       scratch (no exception).  If it has local state to preserve, log a
-       warning and return normally (no exception).
+    1. Compute the workspace path (``<ticket_dir>/repo``, sanitizing the
+       identifier) and verify it is within *workspace_root*.
+    2. Clone the repository into ``repo/`` if it does not already exist,
+       otherwise fetch to pick up new remote branches.
+    3. On fetch failure: if the workspace is clean, nuke ``repo/`` and
+       re-clone from scratch (no exception).  If it has local state to
+       preserve, log a warning and return normally (no exception).
 
     .. note::
        Clone has no ``-b`` — it checks out the remote's default branch.
@@ -613,8 +656,9 @@ def prepare(
     :func:`finalize_workspace`.  See those functions for full documentation
     of each step.
 
-    Also creates the per-ticket attachments directory at
-    ``<workspace_root>/.attachments/<sanitized_identifier>/`` with mode 0700.
+    Also creates the per-ticket attachments and tmp directories at
+    ``<workspace_root>/<sanitized_identifier>/{attachments,tmp}/`` with
+    mode 0700.
 
     Returns:
         The real path to the prepared workspace.
@@ -637,8 +681,9 @@ def prepare(
         auto_branch=auto_branch,
     )
 
-    # Ensure the per-ticket attachments directory exists.
+    # Ensure the per-ticket attachments and tmp directories exist.
     ensure_attachments_dir(ticket_identifier, workspace_root)
+    ensure_tmp_dir(ticket_identifier, workspace_root)
 
     return real_path
 
@@ -647,9 +692,10 @@ def remove(
     ticket_identifier: str,
     workspace_root: str,
 ) -> None:
-    """Delete the workspace and attachments directory for *ticket_identifier*.
+    """Delete the per-ticket directory (repo, attachments, tmp) for
+    *ticket_identifier*.
 
-    Idempotent — no error if the workspace or attachments dir is already gone.
+    Idempotent — no error if the ticket directory is already gone.
 
     Args:
         ticket_identifier: Human-readable ticket ID.
@@ -658,27 +704,16 @@ def remove(
     Raises:
         PathContainmentError: If the computed path escapes *workspace_root*.
     """
-    workspace_path = compute_workspace_path(ticket_identifier, workspace_root)
+    ticket_dir = compute_ticket_dir(ticket_identifier, workspace_root)
 
     # Verify containment before removing anything.
-    _check_containment(workspace_path, workspace_root)
+    _check_containment(ticket_dir, workspace_root)
 
-    # Remove the workspace clone.
-    if os.path.isdir(workspace_path):
-        logger.info("Removing workspace %s", workspace_path)
-        shutil.rmtree(workspace_path, ignore_errors=False)
-        logger.info("Workspace %s removed", workspace_path)
-    else:
-        logger.debug("Workspace %s does not exist – nothing to remove", workspace_path)
-
-    # Remove the attachments directory.
-    attachments_dir = compute_attachments_path(ticket_identifier, workspace_root)
-    _check_containment(attachments_dir, workspace_root)
-    if os.path.isdir(attachments_dir):
-        logger.info("Removing attachments %s", attachments_dir)
-        shutil.rmtree(attachments_dir, ignore_errors=False)
-        logger.info("Attachments %s removed", attachments_dir)
+    if os.path.isdir(ticket_dir):
+        logger.info("Removing ticket directory %s", ticket_dir)
+        shutil.rmtree(ticket_dir, ignore_errors=False)
+        logger.info("Ticket directory %s removed", ticket_dir)
     else:
         logger.debug(
-            "Attachments %s does not exist – nothing to remove", attachments_dir
+            "Ticket directory %s does not exist – nothing to remove", ticket_dir
         )
