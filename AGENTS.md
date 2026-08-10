@@ -116,7 +116,9 @@ shutting down, or the ticket is no longer triggered — see `_is_still_triggered
   `StateManager.save()` without preserving that.
 - **The sandbox shares the network namespace** (the agent needs internet) but
   unshares user/pid/ipc/uts. Credential dirs (`~/.ssh`, etc.) are hidden via
-  `--tmpfs` (dirs) or `--ro-bind /dev/null` (files/sockets). Git ops run
+  `--tmpfs` (dirs) or `--ro-bind /dev/null` (files/sockets). The per-ticket
+  `tmp/` dir is bind-mounted read-write at `/tmp` inside the sandbox —
+  it is per-ticket, disk-backed, and deleted with the ticket dir. Git ops run
   *outside* the sandbox using the daemon's credentials; OpenCode and
   `.symphony/setup` run *inside*.
 - **The OpenCode session id is captured from the first NDJSON event** that
@@ -165,6 +167,8 @@ behaviour, not ours. The NDJSON parser is unit-tested against a fixture.
 
 ## Conventions
 
+- This repo is managed with jj (jujutsu): git HEAD is detached by design.
+  Don't try to "fix" it or expect a checked-out branch.
 - Code style follows what's there: explicit `from __future__ import annotations`,
   PEP 604 unions (`str | None`), module-level `logger = logging.getLogger(__name__)`,
   typed exceptions per module (`LinearError`, `OpenCodeError`, `WorkspaceError`

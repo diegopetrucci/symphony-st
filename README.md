@@ -433,7 +433,8 @@ GitHub) for tickets that carry the trigger signal and live in one of the
 active workflow states. New tickets enter the **initial pipeline**:
 
 1. Find the project's `Repo` link to discover the git URL.
-2. Clone or update the repo into `<workspace>/<sanitised-identifier>`.
+2. Clone or update the repo into
+   `<workspace>/<sanitised-identifier>/repo`.
 3. Switch to the ticket's branch, creating one if needed. If
    `auto_branch: false` is set, the workspace stays on whatever `git clone`
    produced (typically the remote default branch).
@@ -462,6 +463,11 @@ handful of others are concealed by overlaying empty tmpfs or `/dev/null`.
 The network namespace is shared so the agent can reach the internet, but
 user, PID, IPC and UTS namespaces are isolated. Environment is wiped down
 to `HOME` plus an inherited `PATH` (or `SYMPHONY_SANDBOX_PATH` if set).
+
+`/tmp` inside the sandbox is not the host's shared `/tmp`: it is bound to
+the ticket's own `tmp/` directory on disk, so scratch files are per-ticket,
+survive the sandbox process, and are deleted along with the ticket's
+directory when the ticket is cleaned up.
 
 Git operations run outside the sandbox using the daemon's own credentials,
 so cloning private repositories works without exposing your keys to the
@@ -536,19 +542,20 @@ this shape:
 
 ```
 **Symphony**
-- workspace: `<workspace>/TEAM-42`
+- workspace: `<workspace>/TEAM-42/repo`
 - session: `ses_abc123`
 ```
 
 The workspace path is where the repo was cloned (Linear tickets use the
 team key + number like `TEAM-42`; GitHub issues use
-`<owner>-<repo>-<number>`). The session id is the OpenCode session you can
-resume manually.
+`<owner>-<repo>-<number>`; the clone itself lives in the `repo/`
+subdirectory of the ticket's directory). The session id is the OpenCode
+session you can resume manually.
 
 ### Resume a session by hand
 
 ```bash
-cd <workspace>/TEAM-42
+cd <workspace>/TEAM-42/repo
 opencode run --session ses_abc123 -- "Hello, what's the status?"
 ```
 
