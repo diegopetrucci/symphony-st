@@ -27,6 +27,7 @@ def _expand(path: str) -> str:
 def run_in_sandbox(
     cmd: list[str],
     workspace_path: str,
+    tmp_path: str,
     hide_paths: list[str],
     env: dict[str, str],
     stdin: Any = None,
@@ -40,10 +41,17 @@ def run_in_sandbox(
     The caller is responsible for managing the process lifetime (wait, kill,
     timeout, etc.).
 
+    This function is side-effect-free: it never creates directories.  bwrap's
+    ``--bind`` is fatal when the source directory does not exist, so callers
+    must ensure *tmp_path* (and *workspace_path*) exist before calling.
+
     Args:
         cmd: The command and arguments to execute inside the sandbox.
         workspace_path: Host path to the workspace directory, which will be
             mounted **read-write** at the same location inside the sandbox.
+        tmp_path: Host path to the per-ticket tmp directory, which will be
+            mounted **read-write** at ``/tmp`` inside the sandbox (replacing
+            the host's shared ``/tmp``).  Must exist on the host.
         hide_paths: List of host paths to conceal inside the sandbox.
             Directories are overlaid with an empty ``tmpfs``; files (including
             sockets) are replaced with ``/dev/null``.  ``~`` and symlinks are
@@ -90,6 +98,7 @@ def run_in_sandbox(
     cache_dir = str(Path("~/.cache").expanduser())
     local_share_dir = str(Path("~/.local/share").expanduser())
     expanded_workspace = _expand(workspace_path)
+    expanded_tmp = _expand(tmp_path)
 
     # ------------------------------------------------------------------
     # Build bwrap argument list
@@ -103,12 +112,16 @@ def run_in_sandbox(
     # 1. Read-only bind of the entire host filesystem
     bwrap_args.extend(["--ro-bind", "/", "/"])
 
-    # 2. Read-write bind for the workspace
-    bwrap_args.extend(["--bind", expanded_workspace, expanded_workspace])
+    # 2. Read-write bind for /tmp (must come BEFORE both the attachments
+    #    mount, so that bwrap can create /tmp/symphony-attachments, and the
+    #    workspace bind, so that a workspace living under the host /tmp is
+    #    not shadowed by the re-bound /tmp).  The per-ticket tmp dir replaces
+    #    the host's shared /tmp so ticket cleanup reclaims the space.  The
+    #    caller must ensure the dir exists (--bind is fatal otherwise).
+    bwrap_args.extend(["--bind", expanded_tmp, "/tmp"])
 
-    # 3. Read-write bind for /tmp (must come BEFORE the attachments mount
-    #    so that bwrap can create /tmp/symphony-attachments).
-    bwrap_args.extend(["--bind", "/tmp", "/tmp"])
+    # 3. Read-write bind for the workspace
+    bwrap_args.extend(["--bind", expanded_workspace, expanded_workspace])
 
     # 3a. Read-only bind for the per-ticket attachments directory (if any).
     if attachments_path is not None:

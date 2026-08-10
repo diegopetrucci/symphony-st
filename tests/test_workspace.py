@@ -491,11 +491,14 @@ class TestPrepareRemoveIntegration:
 
         # 1. Create a source repo with a .symphony/setup script.
         source_repo = tmp_path / "source"
-        marker_file = tmp_path / "setup_marker.txt"
 
+        # The setup script writes its marker via a relative path: the sandbox
+        # binds the workspace read-write and chdirs into it, while /tmp is the
+        # per-ticket tmp dir — an absolute host /tmp path would land there.
+        marker_name = "setup-marker.txt"
         _make_source_repo(
             source_repo,
-            setup_script=(f"#!/bin/bash\necho 'setup ran' > {marker_file}\n"),
+            setup_script=(f"#!/bin/bash\necho 'setup ran' > ./{marker_name}\n"),
         )
 
         # 2. Prepare the workspace.
@@ -540,7 +543,8 @@ class TestPrepareRemoveIntegration:
         assert branch_result.returncode == 0
         assert branch_result.stdout.strip() == "symphony/team-42"
 
-        # 5. Verify the setup script ran (marker file exists).
+        # 5. Verify the setup script ran (marker file exists in the workspace).
+        marker_file = Path(result_path) / marker_name
         assert marker_file.exists()
         assert marker_file.read_text().strip() == "setup ran"
 
@@ -1234,10 +1238,13 @@ class TestFinalizeWorkspace:
         workspace_root.mkdir()
 
         source_repo = tmp_path / "source"
-        marker_file = tmp_path / "finalize_marker.txt"
+        # The setup script writes its marker via a relative path (cwd is the
+        # workspace inside the sandbox); /tmp is the per-ticket tmp dir, so an
+        # absolute host /tmp path would land there instead.
+        marker_name = "finalize-marker.txt"
         _make_source_repo(
             source_repo,
-            setup_script=(f"#!/bin/bash\necho 'finalize ran' > {marker_file}\n"),
+            setup_script=(f"#!/bin/bash\necho 'finalize ran' > ./{marker_name}\n"),
         )
 
         # Clone first.
@@ -1253,6 +1260,7 @@ class TestFinalizeWorkspace:
             ticket_identifier="FINALIZE-1",
             branch_name=None,  # default: symphony/finalize-1
             sandbox_hide_paths=[],
+            tmp_path=ensure_tmp_dir("FINALIZE-1", str(workspace_root)),
         )
 
         # Verify branch.
@@ -1264,7 +1272,8 @@ class TestFinalizeWorkspace:
         )
         assert branch_result.stdout.strip() == "symphony/finalize-1"
 
-        # Verify setup ran.
+        # Verify setup ran (marker file exists in the workspace).
+        marker_file = Path(ws_path) / marker_name
         assert marker_file.exists()
         assert marker_file.read_text().strip() == "finalize ran"
 
@@ -1292,6 +1301,7 @@ class TestFinalizeWorkspace:
             branch_name="symphony/no-branch",  # supplied but ignored
             sandbox_hide_paths=[],
             auto_branch=False,
+            tmp_path=ensure_tmp_dir("NO-BRANCH", str(workspace_root)),
         )
 
         branch_result = subprocess.run(
@@ -1335,6 +1345,7 @@ class TestFinalizeWorkspace:
             ticket_identifier="NO-SETUP-F",
             branch_name="main",
             sandbox_hide_paths=[],
+            tmp_path=ensure_tmp_dir("NO-SETUP-F", str(workspace_root)),
         )
 
         remove("NO-SETUP-F", str(workspace_root))
@@ -1365,6 +1376,7 @@ class TestFinalizeWorkspace:
                 ticket_identifier="FAIL-FIN",
                 branch_name="main",
                 sandbox_hide_paths=[],
+                tmp_path=ensure_tmp_dir("FAIL-FIN", str(workspace_root)),
             )
 
         assert "13" in str(exc_info.value)
@@ -1392,6 +1404,7 @@ class TestFinalizeWorkspace:
             ticket_identifier="My-Team.42",
             branch_name=None,
             sandbox_hide_paths=[],
+            tmp_path=ensure_tmp_dir("My-Team.42", str(workspace_root)),
         )
 
         branch_result = subprocess.run(
@@ -1418,7 +1431,7 @@ class TestStartServeMissingScript:
         workspace = tmp_path / "ws"
         workspace.mkdir()
         with pytest.raises(ServeScriptMissing, match=r"\.symphony/serve"):
-            start_serve(str(workspace), hide_paths=[])
+            start_serve(str(workspace), hide_paths=[], tmp_path=str(tmp_path / "t"))
 
     def test_raises_when_serve_file_absent(self, tmp_path: Path) -> None:
         """Directory exists but serve file is missing → ServeScriptMissing."""
@@ -1426,7 +1439,7 @@ class TestStartServeMissingScript:
         symphony_dir = workspace / ".symphony"
         symphony_dir.mkdir(parents=True)
         with pytest.raises(ServeScriptMissing, match=r"\.symphony/serve"):
-            start_serve(str(workspace), hide_paths=[])
+            start_serve(str(workspace), hide_paths=[], tmp_path=str(tmp_path / "t"))
 
     def test_raises_when_serve_not_executable(self, tmp_path: Path) -> None:
         """serve file exists but is not executable → ServeScriptMissing."""
@@ -1438,7 +1451,7 @@ class TestStartServeMissingScript:
         # Explicitly remove execute bit
         serve_file.chmod(0o644)
         with pytest.raises(ServeScriptMissing, match=r"\.symphony/serve"):
-            start_serve(str(workspace), hide_paths=[])
+            start_serve(str(workspace), hide_paths=[], tmp_path=str(tmp_path / "t"))
 
     def test_serve_script_missing_is_workspace_error(self) -> None:
         """ServeScriptMissing is a subclass of WorkspaceError."""
@@ -1469,7 +1482,10 @@ class TestStartServeIntegration:
         serve_file.write_text("#!/bin/bash\nsleep 60\n")
         serve_file.chmod(serve_file.stat().st_mode | stat.S_IEXEC)
 
-        proc = start_serve(str(workspace), hide_paths=[])
+        ticket_tmp = tmp_path / "ticket-tmp"
+        ticket_tmp.mkdir()
+
+        proc = start_serve(str(workspace), hide_paths=[], tmp_path=str(ticket_tmp))
         try:
             # Process should still be running (sleep 60).
             assert proc.poll() is None, "serve process exited prematurely"
@@ -1494,8 +1510,14 @@ class TestStartServeIntegration:
         extra_dir = tmp_path / "extra"
         extra_dir.mkdir()
 
+        ticket_tmp = tmp_path / "ticket-tmp"
+        ticket_tmp.mkdir()
+
         proc = start_serve(
-            str(workspace), hide_paths=[], extra_rw_paths=[str(extra_dir)]
+            str(workspace),
+            hide_paths=[],
+            extra_rw_paths=[str(extra_dir)],
+            tmp_path=str(ticket_tmp),
         )
         try:
             assert proc.poll() is None

@@ -437,6 +437,7 @@ class TestExecuteTimeout:
             with pytest.raises(OpenCodeTimeout) as excinfo:
                 run_initial(
                     workspace_path="/ws",
+                    tmp_path="/ws/tmp",
                     prompt="do it",
                     timeout_seconds=30,
                     on_subprocess=lambda p: None,
@@ -465,6 +466,7 @@ class TestExecuteTimeout:
             with pytest.raises(OpenCodeTimeout) as excinfo:
                 run_initial(
                     workspace_path="/ws",
+                    tmp_path="/ws/tmp",
                     prompt="do it",
                     timeout_seconds=30,
                     on_subprocess=lambda p: None,
@@ -493,6 +495,7 @@ class TestExecuteTimeout:
             with pytest.raises(OpenCodeTimeout) as excinfo:
                 run_initial(
                     workspace_path="/ws",
+                    tmp_path="/ws/tmp",
                     prompt="do it",
                     timeout_seconds=30,
                     on_subprocess=lambda p: None,
@@ -508,6 +511,7 @@ class TestExecuteTimeout:
             with pytest.raises(OpenCodeTimeout) as excinfo:
                 run_initial(
                     workspace_path="/ws",
+                    tmp_path="/ws/tmp",
                     prompt="do it",
                     timeout_seconds=30,
                     on_subprocess=lambda p: None,
@@ -525,6 +529,7 @@ class TestExecuteTimeout:
             with pytest.raises(OpenCodeTimeout) as excinfo:
                 run_initial(
                     workspace_path="/ws",
+                    tmp_path="/ws/tmp",
                     prompt="do it",
                     timeout_seconds=30,
                     on_subprocess=lambda p: None,
@@ -593,6 +598,7 @@ class TestFilesArgv:
         ) as mock_sandbox:
             run_initial(
                 workspace_path="/ws",
+                tmp_path="/ws/tmp",
                 prompt="hello",
                 timeout_seconds=60,
                 on_subprocess=lambda p: None,
@@ -608,6 +614,7 @@ class TestFilesArgv:
         ) as mock_sandbox:
             run_initial(
                 workspace_path="/ws",
+                tmp_path="/ws/tmp",
                 prompt="hello",
                 timeout_seconds=60,
                 on_subprocess=lambda p: None,
@@ -624,6 +631,7 @@ class TestFilesArgv:
         ) as mock_sandbox:
             run_initial(
                 workspace_path="/ws",
+                tmp_path="/ws/tmp",
                 prompt="hello",
                 timeout_seconds=60,
                 on_subprocess=lambda p: None,
@@ -641,6 +649,7 @@ class TestFilesArgv:
         ) as mock_sandbox:
             run_initial(
                 workspace_path="/ws",
+                tmp_path="/ws/tmp",
                 prompt="hello",
                 timeout_seconds=60,
                 on_subprocess=lambda p: None,
@@ -661,6 +670,7 @@ class TestFilesArgv:
         ) as mock_sandbox:
             run_initial(
                 workspace_path="/ws",
+                tmp_path="/ws/tmp",
                 prompt="hello",
                 timeout_seconds=60,
                 on_subprocess=lambda p: None,
@@ -679,6 +689,7 @@ class TestFilesArgv:
         ) as mock_sandbox:
             run_resume(
                 workspace_path="/ws",
+                tmp_path="/ws/tmp",
                 session_id="ses_x",
                 message="continue",
                 timeout_seconds=60,
@@ -695,6 +706,7 @@ class TestFilesArgv:
         ) as mock_sandbox:
             run_resume(
                 workspace_path="/ws",
+                tmp_path="/ws/tmp",
                 session_id="ses_x",
                 message="continue",
                 timeout_seconds=60,
@@ -717,6 +729,7 @@ class TestFilesArgv:
         ) as mock_sandbox:
             run_resume(
                 workspace_path="/ws",
+                tmp_path="/ws/tmp",
                 session_id="ses_x",
                 message="continue",
                 timeout_seconds=60,
@@ -742,11 +755,63 @@ class TestRunResumeGuard:
         with pytest.raises(OpenCodeError, match="non-empty session_id"):
             run_resume(
                 workspace_path="/ws",
+                tmp_path="/ws/tmp",
                 session_id=session_id,
                 message="continue",
                 timeout_seconds=60,
                 on_subprocess=lambda p: None,
             )
+
+
+# ---------------------------------------------------------------------------
+# Unit: tmp_path is forwarded to the sandbox
+# ---------------------------------------------------------------------------
+
+
+class TestTmpPathForwarded:
+    """run_initial / run_resume pass tmp_path through to run_in_sandbox."""
+
+    @staticmethod
+    def _make_fake_popen() -> MagicMock:
+        events = [
+            {"type": "step_start", "sessionID": "ses_test", "part": {}},
+            {"type": "text", "sessionID": "ses_test", "part": {"text": "ok"}},
+            {"type": "step_finish", "sessionID": "ses_test", "part": {}},
+        ]
+        stdout = "\n".join(json.dumps(e) for e in events).encode()
+        proc = MagicMock(spec=subprocess.Popen)
+        proc.returncode = 0
+        proc.communicate.return_value = (stdout, b"")
+        return proc
+
+    def test_run_initial_forwards_tmp_path(self) -> None:
+        fake_proc = self._make_fake_popen()
+        with patch(
+            "symphony_linear.opencode.run_in_sandbox", return_value=fake_proc
+        ) as mock_sandbox:
+            run_initial(
+                workspace_path="/ws",
+                prompt="hello",
+                timeout_seconds=60,
+                on_subprocess=lambda p: None,
+                tmp_path="/ws/tmp",
+            )
+        assert mock_sandbox.call_args.kwargs["tmp_path"] == "/ws/tmp"
+
+    def test_run_resume_forwards_tmp_path(self) -> None:
+        fake_proc = self._make_fake_popen()
+        with patch(
+            "symphony_linear.opencode.run_in_sandbox", return_value=fake_proc
+        ) as mock_sandbox:
+            run_resume(
+                workspace_path="/ws",
+                session_id="ses_x",
+                message="continue",
+                timeout_seconds=60,
+                on_subprocess=lambda p: None,
+                tmp_path="/ws/tmp",
+            )
+        assert mock_sandbox.call_args.kwargs["tmp_path"] == "/ws/tmp"
 
 
 # ---------------------------------------------------------------------------

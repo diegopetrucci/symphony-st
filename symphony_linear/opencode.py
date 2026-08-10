@@ -184,6 +184,7 @@ def run_initial(
     hide_paths: list[str] | None = None,
     extra_rw_paths: list[str] | None = None,
     attachments_path: str | None = None,
+    tmp_path: str,
     files: list[str] | None = None,
 ) -> tuple[str, str, int | None]:
     """Launch OpenCode for a new session with *prompt* and return the session
@@ -205,6 +206,9 @@ def run_initial(
             sandbox.  Defaults to empty list.
         attachments_path: Optional host path to a per-ticket attachments
             directory.  Passed through to the sandbox.
+        tmp_path: Host path to the per-ticket tmp directory, mounted at
+            ``/tmp`` inside the sandbox.  Must exist on the host (bwrap
+            ``--bind`` is fatal otherwise).
         files: File paths to attach to the turn via ``--file``.  Each path is
             emitted as a ``--file <path>`` pair before the ``--`` separator.
             Defaults to ``None`` (no files).
@@ -240,6 +244,7 @@ def run_initial(
         hide_paths=hide_paths or [],
         extra_rw_paths=extra_rw_paths or [],
         attachments_path=attachments_path,
+        tmp_path=tmp_path,
     )
 
 
@@ -253,6 +258,7 @@ def run_resume(
     hide_paths: list[str] | None = None,
     extra_rw_paths: list[str] | None = None,
     attachments_path: str | None = None,
+    tmp_path: str,
     files: list[str] | None = None,
 ) -> tuple[str, int | None]:
     """Resume an existing OpenCode session with a follow-up *message*.
@@ -275,6 +281,9 @@ def run_resume(
             sandbox.  Defaults to empty list.
         attachments_path: Optional host path to a per-ticket attachments
             directory.  Passed through to the sandbox.
+        tmp_path: Host path to the per-ticket tmp directory, mounted at
+            ``/tmp`` inside the sandbox.  Must exist on the host (bwrap
+            ``--bind`` is fatal otherwise).
         files: File paths to attach to the turn via ``--file``.  Each path is
             emitted as a ``--file <path>`` pair before the ``--`` separator.
             Defaults to ``None`` (no files).
@@ -318,6 +327,7 @@ def run_resume(
         hide_paths=hide_paths or [],
         extra_rw_paths=extra_rw_paths or [],
         attachments_path=attachments_path,
+        tmp_path=tmp_path,
     )
     return final_message, context_tokens
 
@@ -376,6 +386,7 @@ def _parse_stream(stdout_text: str) -> tuple[str | None, list[dict]]:
 def _execute(
     cmd: list[str],
     workspace_path: str,
+    tmp_path: str,
     timeout_seconds: int,
     on_subprocess: Callable[[subprocess.Popen[bytes]], None],
     hide_paths: list[str] | None = None,
@@ -391,6 +402,7 @@ def _execute(
     proc = run_in_sandbox(
         cmd=cmd,
         workspace_path=workspace_path,
+        tmp_path=tmp_path,
         hide_paths=hide_paths or [],
         env={"HOME": home},
         stdout=subprocess.PIPE,

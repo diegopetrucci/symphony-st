@@ -47,6 +47,7 @@ from symphony_linear.workspace import (
     compute_workspace_path,
     dirty_summary,
     ensure_attachments_dir,
+    ensure_tmp_dir,
     finalize_workspace,
     remove,
     start_serve,
@@ -733,10 +734,15 @@ class Orchestrator:
             "Starting QA serve for %s (workspace=%s)", winner.identifier, workspace_path
         )
         try:
+            # The serve-reconcile path runs without prepare(), so ensure the
+            # per-ticket tmp directory exists before launching the sandbox
+            # (bwrap --bind is fatal when the source dir is missing).
+            tmp_path = ensure_tmp_dir(winner.identifier, str(self._workspace))
             proc = start_serve(
                 workspace_path=workspace_path,
                 hide_paths=self._config.sandbox.hide_paths,
                 extra_rw_paths=self._config.sandbox.extra_rw_paths,
+                tmp_path=tmp_path,
             )
         except (ServeScriptMissing, WorkspaceError, FileNotFoundError) as exc:
             logger.error("Failed to start QA serve for %s: %s", winner.identifier, exc)
@@ -1120,6 +1126,10 @@ class Orchestrator:
 
         # --- Finalize workspace (B2: pass on_subprocess for setup script) ---
         try:
+            # Ensure the per-ticket tmp directory exists before the setup
+            # script runs inside the sandbox (bwrap --bind is fatal when the
+            # source dir is missing).
+            tmp_path = ensure_tmp_dir(issue.identifier, str(self._workspace))
             finalize_workspace(
                 workspace_path=workspace_path,
                 ticket_identifier=issue.identifier,
@@ -1130,6 +1140,7 @@ class Orchestrator:
                 ],
                 sandbox_extra_rw_paths=self._config.sandbox.extra_rw_paths,
                 auto_branch=effective_auto_branch,
+                tmp_path=tmp_path,
             )
         except (WorkspaceError, FileNotFoundError) as exc:
             logger.error("Workspace finalization failed for %s: %s", tid, exc)
@@ -1294,6 +1305,7 @@ class Orchestrator:
                 hide_paths=self._config.sandbox.hide_paths,
                 extra_rw_paths=self._config.sandbox.extra_rw_paths,
                 attachments_path=host_attachments_dir,
+                tmp_path=tmp_path,
                 files=files,
             )
         except OpenCodeTimeout as exc:
@@ -1439,6 +1451,10 @@ class Orchestrator:
         host_attachments_dir = ensure_attachments_dir(
             ticket_state.ticket_identifier, str(self._workspace)
         )
+        # Ensure the per-ticket tmp directory exists before the resumed turn
+        # runs inside the sandbox (bwrap --bind is fatal when the source dir
+        # is missing).
+        tmp_path = ensure_tmp_dir(ticket_state.ticket_identifier, str(self._workspace))
         try:
             result = process_attachments(
                 message,
@@ -1544,6 +1560,7 @@ class Orchestrator:
                 hide_paths=self._config.sandbox.hide_paths,  # B3
                 extra_rw_paths=self._config.sandbox.extra_rw_paths,
                 attachments_path=host_attachments_dir,
+                tmp_path=tmp_path,
                 files=files_attach,
             )
         except OpenCodeTimeout as exc:

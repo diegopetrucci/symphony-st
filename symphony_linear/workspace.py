@@ -227,6 +227,8 @@ def _run_setup_script(
     hide_paths: list[str],
     on_subprocess: Callable[[subprocess.Popen[bytes]], None] | None = None,
     extra_rw_paths: list[str] | None = None,
+    *,
+    tmp_path: str,
 ) -> None:
     """Run ``.symphony/setup`` inside the sandbox.
 
@@ -237,6 +239,9 @@ def _run_setup_script(
             immediately after launch, for external cancellation.
         extra_rw_paths: Additional host paths to bind read-write inside the
             sandbox.
+        tmp_path: Host path to the per-ticket tmp directory, mounted at
+            ``/tmp`` inside the sandbox.  Must exist on the host (bwrap
+            ``--bind`` is fatal otherwise).
 
     Raises:
         SetupFailed: If the script exits with a non-zero code or times out.
@@ -251,6 +256,7 @@ def _run_setup_script(
     proc = run_in_sandbox(
         cmd=["./.symphony/setup"],
         workspace_path=workspace_path,
+        tmp_path=tmp_path,
         hide_paths=hide_paths,
         env={
             "HOME": os.environ.get("HOME", str(Path.home())),
@@ -303,6 +309,8 @@ def start_serve(
     workspace_path: str,
     hide_paths: list[str],
     extra_rw_paths: list[str] | None = None,
+    *,
+    tmp_path: str,
 ) -> subprocess.Popen[bytes]:
     """Launch ``.symphony/serve`` inside the sandbox and return the Popen handle.
 
@@ -316,6 +324,9 @@ def start_serve(
         hide_paths: Paths to conceal inside the sandbox.
         extra_rw_paths: Additional host paths to bind read-write inside the
             sandbox.
+        tmp_path: Host path to the per-ticket tmp directory, mounted at
+            ``/tmp`` inside the sandbox.  Must exist on the host (bwrap
+            ``--bind`` is fatal otherwise).
 
     Returns:
         A :class:`~subprocess.Popen` instance for the sandboxed serve process.
@@ -337,6 +348,7 @@ def start_serve(
     return run_in_sandbox(
         cmd=["./.symphony/serve"],
         workspace_path=workspace_path,
+        tmp_path=tmp_path,
         hide_paths=hide_paths,
         env={
             "HOME": os.environ.get("HOME", str(Path.home())),
@@ -584,6 +596,8 @@ def finalize_workspace(
     on_subprocess: Callable[[subprocess.Popen[bytes]], None] | None = None,
     sandbox_extra_rw_paths: list[str] | None = None,
     auto_branch: bool = True,
+    *,
+    tmp_path: str,
 ) -> None:
     """Finalize a cloned workspace for *ticket_identifier*.
 
@@ -612,6 +626,9 @@ def finalize_workspace(
         auto_branch: If true (default), switch to a per-ticket branch after
             clone/fetch. If false, skip the branch switch entirely and leave
             the workspace on the cloned default branch.
+        tmp_path: Host path to the per-ticket tmp directory, mounted at
+            ``/tmp`` inside the sandbox.  Must exist on the host (bwrap
+            ``--bind`` is fatal otherwise).
 
     Raises:
         BranchFailed: If ``git switch`` fails.
@@ -637,6 +654,7 @@ def finalize_workspace(
         sandbox_hide_paths,
         on_subprocess=on_subprocess,
         extra_rw_paths=sandbox_extra_rw_paths,
+        tmp_path=tmp_path,
     )
 
 
@@ -658,7 +676,8 @@ def prepare(
 
     Also creates the per-ticket attachments and tmp directories at
     ``<workspace_root>/<sanitized_identifier>/{attachments,tmp}/`` with
-    mode 0700.
+    mode 0700.  The tmp directory is created **before** the setup script
+    runs, because the sandbox binds it at ``/tmp``.
 
     Returns:
         The real path to the prepared workspace.
@@ -671,6 +690,11 @@ def prepare(
         SetupFailed: If ``.symphony/setup`` fails or times out.
     """
     real_path, _ = clone_workspace(ticket_identifier, repo_url, workspace_root)
+
+    # Ensure the per-ticket tmp directory exists before the setup script runs
+    # inside the sandbox — bwrap --bind is fatal when the source is missing.
+    tmp_path = ensure_tmp_dir(ticket_identifier, workspace_root)
+
     finalize_workspace(
         workspace_path=real_path,
         ticket_identifier=ticket_identifier,
@@ -679,11 +703,11 @@ def prepare(
         on_subprocess=on_subprocess,
         sandbox_extra_rw_paths=sandbox_extra_rw_paths,
         auto_branch=auto_branch,
+        tmp_path=tmp_path,
     )
 
-    # Ensure the per-ticket attachments and tmp directories exist.
+    # Ensure the per-ticket attachments directory exists.
     ensure_attachments_dir(ticket_identifier, workspace_root)
-    ensure_tmp_dir(ticket_identifier, workspace_root)
 
     return real_path
 

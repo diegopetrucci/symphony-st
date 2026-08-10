@@ -40,6 +40,17 @@ def _require_bwrap() -> None:
         pytest.skip("bwrap not available")
 
 
+def _make_ticket_tmp(tmp_path: Path) -> Path:
+    """Create and return an existing per-ticket tmp dir for sandbox tests.
+
+    bwrap ``--bind`` is fatal when the source dir is missing, so every
+    integration test must hand run_in_sandbox a directory that exists.
+    """
+    ticket_tmp = tmp_path / "ticket-tmp"
+    ticket_tmp.mkdir(exist_ok=True)
+    return ticket_tmp
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -71,6 +82,7 @@ class TestRunInSandbox:
         proc = run_in_sandbox(
             cmd=["bash", str(SMOKE_SCRIPT)],
             workspace_path=str(workspace),
+            tmp_path=str(_make_ticket_tmp(tmp_path)),
             hide_paths=hide,
             env=env,
             stdout=subprocess.PIPE,
@@ -108,6 +120,7 @@ class TestRunInSandbox:
                 ),
             ],
             workspace_path=str(workspace),
+            tmp_path=str(_make_ticket_tmp(tmp_path)),
             hide_paths=[],
             env={"HOME": str(Path.home())},
             stdout=subprocess.PIPE,
@@ -156,6 +169,7 @@ class TestRunInSandbox:
                 ),
             ],
             workspace_path=str(workspace),
+            tmp_path=str(_make_ticket_tmp(tmp_path)),
             hide_paths=hide,
             env={"HOME": str(Path.home())},
             stdout=subprocess.PIPE,
@@ -183,6 +197,7 @@ class TestRunInSandbox:
         proc = run_in_sandbox(
             cmd=["sleep", "30"],
             workspace_path=str(workspace),
+            tmp_path=str(_make_ticket_tmp(tmp_path)),
             hide_paths=[],
             env={"HOME": str(Path.home())},
             stdout=subprocess.PIPE,
@@ -212,6 +227,7 @@ class TestRunInSandbox:
             run_in_sandbox(
                 cmd=["echo", "hello"],
                 workspace_path="/tmp",
+                tmp_path="/tmp/fake-ticket-tmp",
                 hide_paths=[],
                 env={},
             )
@@ -226,6 +242,7 @@ class TestRunInSandbox:
         proc = run_in_sandbox(
             cmd=["bash", "-c", 'echo "MYVAR=$MYVAR"; echo "EXTRA=$EXTRA"'],
             workspace_path=str(workspace),
+            tmp_path=str(_make_ticket_tmp(tmp_path)),
             hide_paths=[],
             env={
                 "MYVAR": "hello-world",
@@ -258,6 +275,7 @@ class TestRunInSandbox:
         proc = run_in_sandbox(
             cmd=["bash", "-c", 'echo "HOST_ONLY_VAR=${HOST_ONLY_VAR:-<unset>}"'],
             workspace_path=str(workspace),
+            tmp_path=str(_make_ticket_tmp(tmp_path)),
             hide_paths=[],
             env={
                 "HOME": str(Path.home()),
@@ -267,7 +285,7 @@ class TestRunInSandbox:
         )
 
         stdout, stderr = proc.communicate(timeout=30)
-        output = stdout.decode(errors="replace")
+        output = stdout.decode(errors="replace").strip()
 
         assert proc.returncode == 0
         assert "HOST_ONLY_VAR=<unset>" in output, (
@@ -305,6 +323,7 @@ class TestRunInSandbox:
                 ),
             ],
             workspace_path=str(workspace),
+            tmp_path=str(_make_ticket_tmp(tmp_path)),
             hide_paths=["~/.symphony_smoke_test_dir"],
             env={"HOME": str(fake_home)},
             stdout=subprocess.PIPE,
@@ -336,6 +355,7 @@ class TestRunInSandbox:
             proc = run_in_sandbox(
                 cmd=["bash", "-c", "echo 'sandbox-ok'"],
                 workspace_path=str(workspace),
+                tmp_path=str(_make_ticket_tmp(tmp_path)),
                 hide_paths=[],
                 env={"HOME": str(fake_home)},
                 stdout=subprocess.PIPE,
@@ -387,6 +407,7 @@ class TestRunInSandbox:
                 ),
             ],
             workspace_path=str(workspace),
+            tmp_path=str(_make_ticket_tmp(tmp_path)),
             hide_paths=[],
             env={"HOME": str(fake_home)},
             stdout=subprocess.PIPE,
@@ -420,6 +441,7 @@ class TestRunInSandbox:
             proc = run_in_sandbox(
                 cmd=["bash", "-c", "echo 'sandbox-ok'"],
                 workspace_path=str(workspace),
+                tmp_path=str(_make_ticket_tmp(tmp_path)),
                 hide_paths=[],
                 env={"HOME": str(fake_home)},
                 stdout=subprocess.PIPE,
@@ -456,6 +478,7 @@ class TestRunInSandbox:
                 f'touch "{test_file}" && echo "WRITABLE" || echo "NOT_WRITABLE"',
             ],
             workspace_path=str(workspace),
+            tmp_path=str(_make_ticket_tmp(tmp_path)),
             hide_paths=[],
             env={"HOME": str(Path.home())},
             stdout=subprocess.PIPE,
@@ -471,3 +494,40 @@ class TestRunInSandbox:
         )
         assert "WRITABLE" in output, f"Expected WRITABLE, got: {output}"
         assert test_file.exists(), f"File not created: {test_file}"
+
+    def test_tmp_is_per_ticket_dir(self, tmp_path: Path) -> None:
+        """/tmp inside the sandbox is the per-ticket tmp dir, not the host /tmp.
+
+        Files written to /tmp inside the sandbox must land in the per-ticket
+        tmp dir on the host, and must NOT appear in the host's shared /tmp.
+        """
+        _require_bwrap()
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        ticket_tmp = _make_ticket_tmp(tmp_path)
+
+        # A unique name so we can be sure the host /tmp is untouched.
+        marker = f"sandbox-tmp-marker-{os.getpid()}-{id(workspace)}.txt"
+
+        proc = run_in_sandbox(
+            cmd=["bash", "-c", f'echo "per-ticket-tmp" > "/tmp/{marker}"'],
+            workspace_path=str(workspace),
+            tmp_path=str(ticket_tmp),
+            hide_paths=[],
+            env={"HOME": str(Path.home())},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        stdout, stderr = proc.communicate(timeout=30)
+        assert proc.returncode == 0, (
+            f"Sandbox failed: stderr={stderr.decode(errors='replace')}"
+        )
+
+        # The file landed in the per-ticket tmp dir...
+        assert (ticket_tmp / marker).read_text().strip() == "per-ticket-tmp"
+        # ...and not in the host's shared /tmp.
+        assert not (Path("/tmp") / marker).exists(), (
+            f"Sandbox wrote to the host /tmp: /tmp/{marker} exists"
+        )

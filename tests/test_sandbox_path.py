@@ -40,6 +40,8 @@ def _capture_bwrap_args(
     """
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    ticket_tmp = tmp_path / "ticket-tmp"
+    ticket_tmp.mkdir()
 
     # Control the environment variables seen by sandbox.py.
     if symphony_sandbox_path is not None:
@@ -63,6 +65,7 @@ def _capture_bwrap_args(
             run_in_sandbox(
                 cmd=["echo", "hello"],
                 workspace_path=str(workspace),
+                tmp_path=str(ticket_tmp),
                 hide_paths=[],
                 env=env,
             )

@@ -25,8 +25,10 @@ class TestAttachmentsArgv:
 
     - When attachments_path is set, ``--ro-bind <path> /tmp/symphony-attachments`` appears.
     - When attachments_path is None, no ``/tmp/symphony-attachments`` mount appears.
-    - The mount appears after the /tmp bind.
+    - The mount appears after the per-ticket /tmp bind.
     """
+
+    TMP_DIR = "/fake/ws/TEAM-42/tmp"
 
     def test_attachments_path_included(self) -> None:
         """When attachments_path is set, --ro-bind appears in argv."""
@@ -41,6 +43,7 @@ class TestAttachmentsArgv:
                 run_in_sandbox(
                     cmd=["echo", "hi"],
                     workspace_path="/fake/workspace",
+                    tmp_path=self.TMP_DIR,
                     hide_paths=[],
                     env={"HOME": "/fake/home"},
                     attachments_path="/fake/ws/TEAM-42/attachments",
@@ -63,8 +66,8 @@ class TestAttachmentsArgv:
                     f"Expected exactly one --ro-bind ... /tmp/symphony-attachments in args: {args}"
                 )
 
-    def test_attachments_path_order(self) -> None:
-        """The attachments --ro-bind appears after the /tmp --bind."""
+    def test_tmp_path_bound_at_tmp(self) -> None:
+        """The per-ticket tmp dir is bound at /tmp, not the host /tmp."""
         with mock.patch(
             "symphony_linear.sandbox.shutil.which",
             return_value="/usr/bin/bwrap",
@@ -76,6 +79,37 @@ class TestAttachmentsArgv:
                 run_in_sandbox(
                     cmd=["echo", "hi"],
                     workspace_path="/fake/workspace",
+                    tmp_path=self.TMP_DIR,
+                    hide_paths=[],
+                    env={"HOME": "/fake/home"},
+                )
+
+                args = popen_mock.call_args[0][0]
+
+                # The per-ticket tmp dir must be bound read-write at /tmp.
+                triples = list(zip(args, args[1:], args[2:]))
+                assert ("--bind", self.TMP_DIR, "/tmp") in triples, (
+                    f"Expected --bind {self.TMP_DIR} /tmp in args: {args}"
+                )
+                # The host /tmp must NOT be bound directly anymore.
+                assert ("--bind", "/tmp", "/tmp") not in triples, (
+                    f"Host /tmp must not be bound inside the sandbox: {args}"
+                )
+
+    def test_attachments_path_order(self) -> None:
+        """The attachments --ro-bind appears after the per-ticket /tmp --bind."""
+        with mock.patch(
+            "symphony_linear.sandbox.shutil.which",
+            return_value="/usr/bin/bwrap",
+        ):
+            with mock.patch("subprocess.Popen") as popen_mock:
+                popen_mock.return_value.returncode = 0
+                popen_mock.return_value.communicate.return_value = (b"", b"")
+
+                run_in_sandbox(
+                    cmd=["echo", "hi"],
+                    workspace_path="/fake/workspace",
+                    tmp_path=self.TMP_DIR,
                     hide_paths=[],
                     env={"HOME": "/fake/home"},
                     attachments_path="/fake/ws/TEAM-42/attachments",
@@ -87,7 +121,7 @@ class TestAttachmentsArgv:
                 tmp_bind_idx = None
                 att_ro_bind_idx = None
                 for i, arg in enumerate(args):
-                    if arg == "--bind" and args[i + 1] == "/tmp":
+                    if arg == "--bind" and args[i + 1] == self.TMP_DIR:
                         tmp_bind_idx = i
                         break
                 for i, arg in enumerate(args):
@@ -118,6 +152,7 @@ class TestAttachmentsArgv:
                 run_in_sandbox(
                     cmd=["echo", "hi"],
                     workspace_path="/fake/workspace",
+                    tmp_path=self.TMP_DIR,
                     hide_paths=[],
                     env={"HOME": "/fake/home"},
                     # attachments_path omitted (defaults to None)
@@ -157,6 +192,7 @@ class TestExtraRWPathsArgv:
                 run_in_sandbox(
                     cmd=["echo", "hi"],
                     workspace_path="/fake/workspace",
+                    tmp_path="/fake/ws/TEAM-42/tmp",
                     hide_paths=[],
                     env={"HOME": "/fake/home"},
                     extra_rw_paths=["/extra/a", "/extra/b"],
@@ -193,6 +229,7 @@ class TestExtraRWPathsArgv:
                 run_in_sandbox(
                     cmd=["echo", "hi"],
                     workspace_path="/fake/workspace",
+                    tmp_path="/fake/ws/TEAM-42/tmp",
                     hide_paths=[str(hide_dir)],
                     env={"HOME": "/fake/home"},
                     extra_rw_paths=["/extra/collide"],
@@ -230,13 +267,14 @@ class TestExtraRWPathsArgv:
                 run_in_sandbox(
                     cmd=["echo", "hi"],
                     workspace_path="/fake/workspace",
+                    tmp_path="/fake/ws/TEAM-42/tmp",
                     hide_paths=[],
                     env={"HOME": "/fake/home"},
                     extra_rw_paths=None,
                 )
 
                 args = popen_mock.call_args[0][0]
-                # Only 2 --bind: workspace and /tmp (no extras)
+                # Only 2 --bind: workspace and the per-ticket tmp (no extras)
                 assert args.count("--bind") == 2
 
 
@@ -274,10 +312,14 @@ class TestAttachmentsSandboxIntegration:
         workspace = tmp_path / "workspace"
         workspace.mkdir()
 
+        ticket_tmp = tmp_path / "ticket-tmp"
+        ticket_tmp.mkdir()
+
         # Launch bwrap with attachments_path set and cat the file.
         proc = run_in_sandbox(
             cmd=["cat", "/tmp/symphony-attachments/hello.txt"],
             workspace_path=str(workspace),
+            tmp_path=str(ticket_tmp),
             hide_paths=[],
             env={"HOME": str(Path.home())},
             attachments_path=str(attachments_dir),
