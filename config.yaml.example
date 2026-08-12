@@ -116,6 +116,13 @@ poll_interval_seconds: 30
 # Max seconds per AI turn before the process is killed (default: 1800).
 turn_timeout_seconds: 1800
 
+# Max seconds an AI turn may go without producing output on stdout or stderr
+# before the process is killed (default: 1200). This is the idle watchdog:
+# a stalled turn is killed long before the absolute cap above, and the
+# failure comment distinguishes the two modes. Global only — there is no
+# per-project override.
+turn_idle_timeout_seconds: 1200
+
 # Whether to switch the workspace to a per-ticket branch (default: true).
 # When true, prepare() switches to the tracker's suggested branch name
 # (where available), or symphony/<id> as a fallback (creating it if needed).

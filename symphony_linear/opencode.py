@@ -128,23 +128,55 @@ Design notes
 - The process is launched via ``run_in_sandbox`` from ``symphony_linear.sandbox``.
 - The ``on_subprocess`` callback is invoked immediately after launch so the
   orchestrator can register the Popen handle for kill-on-label-removal.
-- Timeout handling uses ``subprocess.Popen.wait(timeout=...)``.  On timeout
-  the process is killed and ``OpenCodeTimeout`` is raised.
+- ``--print-logs`` is passed on every run: it mirrors OpenCode's internal log
+  (the same lines written to ~/.local/share/opencode/log/opencode.log) to
+  stderr for ALL sessions. This is load-bearing for the idle watchdog: while
+  a subagent task runs, the parent's NDJSON stdout is completely silent, so
+  stdout alone is not a liveness signal.
+- Timeout handling uses a two-tier watchdog in :func:`_execute`. Two daemon
+  threads drain stdout/stderr incrementally and record the last-activity
+  timestamp; the main loop kills the process when nothing has been written
+  for ``idle_timeout_seconds`` (idle stall) or after ``timeout_seconds`` in
+  total (absolute cap). Both raise ``OpenCodeTimeout``, with the ``reason``
+  attribute distinguishing the two. A hung OpenCode still emits an hourly
+  'cleanup prune' log line which resets the watchdog — accepted, and no
+  filter is applied to that message because it is an internal format.
 - If the process was killed by external signal (negative returncode), we raise
   ``OpenCodeCancelled`` to distinguish external kills from failures.
 """
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import subprocess
+import threading
+import time
 from pathlib import Path
 from typing import Callable
 
 from symphony_linear.sandbox import run_in_sandbox
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Sandbox environment
+# ---------------------------------------------------------------------------
+
+# Answer the three permissions that default to "ask" in OpenCode 1.18.16 so
+# they can never be raised. This must stay: 'opencode run' auto-approves
+# permission requests only for the top-level session — its event loop does
+# `if (event.properties.sessionID !== mainSessionID) continue` before the
+# auto-approve branch, so an ask raised by a SUBAGENT session (any session
+# created by the task tool) is never answered and the turn hangs until the
+# daemon's absolute timeout. '--dangerously-skip-permissions' is a hidden
+# alias of '--auto' implemented behind that same session-id filter, so it
+# does not help either. The sandbox uses --clearenv, so the variable only
+# reaches OpenCode because it is in the env dict passed to run_in_sandbox.
+OPENCODE_PERMISSION = (
+    '{"external_directory":"allow","doom_loop":"allow","read":"allow"}'
+)
 
 # ---------------------------------------------------------------------------
 # Typed exceptions
@@ -156,14 +188,25 @@ class OpenCodeError(Exception):
 
 
 class OpenCodeTimeout(Exception):
-    """OpenCode process timed out and was killed."""
+    """OpenCode process timed out and was killed.
+
+    ``reason`` distinguishes the two failure modes: an idle stall
+    ("produced no output for Ns") versus the absolute cap
+    ("exceeded Ns in total"). Every production raise site sets it.
+    """
 
     def __init__(
-        self, message: str, partial_message: str = "", session_id: str | None = None
+        self,
+        message: str,
+        partial_message: str = "",
+        session_id: str | None = None,
+        *,
+        reason: str,
     ) -> None:
         super().__init__(message)
         self.partial_message = partial_message
         self.session_id = session_id
+        self.reason = reason
 
 
 class OpenCodeCancelled(Exception):
@@ -180,6 +223,7 @@ def run_initial(
     prompt: str,
     *,
     timeout_seconds: int,
+    idle_timeout_seconds: int,
     on_subprocess: Callable[[subprocess.Popen[bytes]], None],
     hide_paths: list[str] | None = None,
     extra_rw_paths: list[str] | None = None,
@@ -196,7 +240,11 @@ def run_initial(
         prompt: The initial prompt/message to send to OpenCode.
         timeout_seconds: Maximum number of seconds to wait for the turn to
             complete.  If exceeded the process is killed and
-            :class:`OpenCodeTimeout` is raised.
+            :class:`OpenCodeTimeout` is raised with the absolute-cap reason.
+        idle_timeout_seconds: Maximum number of seconds the turn may go
+            without producing any output on stdout or stderr.  If exceeded
+            the process is killed and :class:`OpenCodeTimeout` is raised
+            with the idle-stall reason.
         on_subprocess: Called with the :class:`subprocess.Popen` handle
             immediately after launch.  The caller can use this to register
             the process for external cancellation.
@@ -219,7 +267,8 @@ def run_initial(
 
     Raises:
         OpenCodeError: The subprocess exited with a non-zero code.
-        OpenCodeTimeout: The turn exceeded *timeout_seconds*.
+        OpenCodeTimeout: The turn exceeded *timeout_seconds*, or produced no
+            output for *idle_timeout_seconds*.
         OpenCodeCancelled: The process was killed externally.
     """
     cmd: list[str] = [
@@ -230,6 +279,7 @@ def run_initial(
         "--format",
         "json",
         "--dangerously-skip-permissions",
+        "--print-logs",
     ]
     if files:
         for f in files:
@@ -240,6 +290,7 @@ def run_initial(
         cmd=cmd,
         workspace_path=workspace_path,
         timeout_seconds=timeout_seconds,
+        idle_timeout_seconds=idle_timeout_seconds,
         on_subprocess=on_subprocess,
         hide_paths=hide_paths or [],
         extra_rw_paths=extra_rw_paths or [],
@@ -254,6 +305,7 @@ def run_resume(
     message: str,
     *,
     timeout_seconds: int,
+    idle_timeout_seconds: int,
     on_subprocess: Callable[[subprocess.Popen[bytes]], None],
     hide_paths: list[str] | None = None,
     extra_rw_paths: list[str] | None = None,
@@ -273,7 +325,10 @@ def run_resume(
             a fresh session, and the agent would lose all ticket context.
         message: The follow-up message to send.
         timeout_seconds: Maximum seconds before raising
-            :class:`OpenCodeTimeout`.
+            :class:`OpenCodeTimeout` with the absolute-cap reason.
+        idle_timeout_seconds: Maximum seconds the turn may go without
+            producing output on stdout or stderr before raising
+            :class:`OpenCodeTimeout` with the idle-stall reason.
         on_subprocess: Called with the Popen handle immediately after launch.
         hide_paths: Paths to conceal inside the sandbox.  Defaults to empty
             list (no extra hiding).
@@ -295,7 +350,8 @@ def run_resume(
     Raises:
         OpenCodeError: The subprocess exited with a non-zero code, or
             *session_id* was empty.
-        OpenCodeTimeout: The turn exceeded *timeout_seconds*.
+        OpenCodeTimeout: The turn exceeded *timeout_seconds*, or produced no
+            output for *idle_timeout_seconds*.
         OpenCodeCancelled: The process was killed externally.
     """
     if not session_id:
@@ -313,6 +369,7 @@ def run_resume(
         "--format",
         "json",
         "--dangerously-skip-permissions",
+        "--print-logs",
     ]
     if files:
         for f in files:
@@ -323,6 +380,7 @@ def run_resume(
         cmd=cmd,
         workspace_path=workspace_path,
         timeout_seconds=timeout_seconds,
+        idle_timeout_seconds=idle_timeout_seconds,
         on_subprocess=on_subprocess,
         hide_paths=hide_paths or [],
         extra_rw_paths=extra_rw_paths or [],
@@ -388,12 +446,21 @@ def _execute(
     workspace_path: str,
     tmp_path: str,
     timeout_seconds: int,
+    idle_timeout_seconds: int,
     on_subprocess: Callable[[subprocess.Popen[bytes]], None],
     hide_paths: list[str] | None = None,
     extra_rw_paths: list[str] | None = None,
     attachments_path: str | None = None,
 ) -> tuple[str, str, int | None]:
     """Launch *cmd* inside the sandbox and parse the JSON event stream.
+
+    Runs a two-tier watchdog while the process is alive: one daemon thread
+    per stream drains stdout/stderr incrementally and records the last
+    activity timestamp; the main loop kills the process when nothing has been
+    written for ``idle_timeout_seconds`` (idle stall) or after
+    ``timeout_seconds`` in total (absolute cap). Both failure modes raise
+    :class:`OpenCodeTimeout` with a ``reason`` distinguishing them and with
+    best-effort salvaged partial output.
 
     Returns ``(session_id, final_message, context_tokens)``.
     """
@@ -404,7 +471,7 @@ def _execute(
         workspace_path=workspace_path,
         tmp_path=tmp_path,
         hide_paths=hide_paths or [],
-        env={"HOME": home},
+        env={"HOME": home, "OPENCODE_PERMISSION": OPENCODE_PERMISSION},
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         extra_rw_paths=extra_rw_paths or [],
@@ -414,20 +481,106 @@ def _execute(
     # Let the caller register the Popen handle immediately.
     on_subprocess(proc)
 
+    assert proc.stdout is not None and proc.stderr is not None
+
+    stdout_chunks: list[bytes] = []
+    stderr_chunks: list[bytes] = []
+    activity_lock = threading.Lock()
+    last_activity = time.monotonic()
+
+    def _drain(stream: io.BufferedReader, chunks: list[bytes]) -> None:
+        """Read *stream* until EOF in byte chunks, recording last-activity.
+
+        Chunks rather than lines: liveness must not depend on newline
+        framing. ``read1`` returns as soon as any byte is available, so a
+        process that writes slowly or without newlines still resets the
+        watchdog; ``read(n)`` would block until n bytes or EOF, which would
+        make a trickling stream look stalled.
+        """
+        nonlocal last_activity
+        while True:
+            chunk = stream.read1(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            with activity_lock:
+                last_activity = time.monotonic()
+        stream.close()
+
+    stdout_thread = threading.Thread(
+        target=_drain,
+        args=(proc.stdout, stdout_chunks),
+        name="opencode-stdout",
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=_drain,
+        args=(proc.stderr, stderr_chunks),
+        name="opencode-stderr",
+        daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+
+    start = time.monotonic()
+    timeout_reason: str | None = None
+
     try:
         # ------------------------------------------------------------------
-        # Read stdout line-by-line within the timeout window.
+        # Watchdog loop: exit when the process dies, or kill it when either
+        # deadline fires.
         # ------------------------------------------------------------------
-        try:
-            stdout_bytes, stderr_bytes = proc.communicate(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
+        while True:
+            if proc.poll() is not None:
+                break
+            with activity_lock:
+                elapsed_total = time.monotonic() - start
+                elapsed_idle = time.monotonic() - last_activity
+            if elapsed_total >= timeout_seconds:
+                timeout_reason = f"exceeded {timeout_seconds}s in total"
+                break
+            if elapsed_idle >= idle_timeout_seconds:
+                timeout_reason = f"produced no output for {elapsed_idle:.0f}s"
+                break
+            # Block until the process exits or the nearer of the two
+            # deadlines arrives: wait() returns as soon as the process dies,
+            # so a healthy turn is reaped promptly instead of being
+            # discovered only after the idle window expires. On deadline it
+            # raises TimeoutExpired and we re-evaluate both deadlines (fresh
+            # output from the drain threads may have pushed the idle one).
+            try:
+                proc.wait(
+                    timeout=max(
+                        0.0,
+                        min(
+                            timeout_seconds - elapsed_total,
+                            idle_timeout_seconds - elapsed_idle,
+                        ),
+                    )
+                )
+            except subprocess.TimeoutExpired:
+                pass
+
+        if timeout_reason is not None:
+            # Kill and reap so the pipes close and the drain threads finish.
             proc.kill()
-            stdout_bytes, stderr_bytes = proc.communicate()
-            stdout_tail = stdout_bytes.decode(errors="replace")
-            stderr_tail = _tail(stderr_bytes.decode(errors="replace"))
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                logger.warning("OpenCode process did not exit after kill")
+
+        # Give the drain threads a chance to flush buffered output; they
+        # finish on EOF. A leftover grandchild holding a pipe open only
+        # means we proceed with what we have.
+        stdout_thread.join(timeout=10)
+        stderr_thread.join(timeout=10)
+
+        if timeout_reason is not None:
+            stdout_text = b"".join(stdout_chunks).decode(errors="replace")
+            stderr_tail = _tail(b"".join(stderr_chunks).decode(errors="replace"))
             # Best-effort salvage of partial output — must never mask the timeout.
             try:
-                partial_session_id, partial_events = _parse_stream(stdout_tail)
+                partial_session_id, partial_events = _parse_stream(stdout_text)
                 partial_message = _assemble_message(partial_events)
             except Exception:
                 logger.debug(
@@ -436,17 +589,17 @@ def _execute(
                 partial_session_id = None
                 partial_message = ""
             raise OpenCodeTimeout(
-                f"OpenCode turn timed out after {timeout_seconds}s\n"
-                f"stderr: {stderr_tail}",
+                f"OpenCode turn timed out: {timeout_reason}\nstderr: {stderr_tail}",
                 partial_message=partial_message,
                 session_id=partial_session_id,
+                reason=timeout_reason,
             )
 
         # ------------------------------------------------------------------
         # Decode outputs once.
         # ------------------------------------------------------------------
-        stdout_text = stdout_bytes.decode(errors="replace")
-        stderr_tail = stderr_bytes.decode(errors="replace") if stderr_bytes else ""
+        stdout_text = b"".join(stdout_chunks).decode(errors="replace")
+        stderr_tail = b"".join(stderr_chunks).decode(errors="replace")
 
         # Raw OpenCode output; only useful when diagnosing parse/protocol issues.
         logger.debug("=== raw OpenCode stdout ===\n%s\n=== end stdout ===", stdout_text)

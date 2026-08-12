@@ -124,6 +124,20 @@ shutting down, or the ticket is no longer triggered — see `_is_still_triggered
 - **The OpenCode session id is captured from the first NDJSON event** that
   includes `sessionID`. The final assistant message is the concatenation of
   all `"text"` events. Other event types are intentionally ignored.
+- **`OPENCODE_PERMISSION` is injected into the sandbox env for every turn** to
+  pre-answer the three permissions that default to `ask` (external_directory,
+  doom_loop, read); do not delete it as redundant with
+  `--dangerously-skip-permissions` — that flag auto-approves only top-level
+  session events, so a subagent permission ask would hang the turn forever.
+- **Turns have an idle watchdog on top of the absolute timeout.** `_execute`
+  drains stdout/stderr with one thread per stream and kills the process when
+  neither produced output for `turn_idle_timeout_seconds` (default 1200s) or
+  after `turn_timeout_seconds` in total; the tracker comment says which limit
+  fired (`OpenCodeTimeout.reason`). Load-bearing: `--print-logs` in both
+  `run_initial` and `run_resume` mirrors OpenCode's internal log to stderr —
+  the parent's NDJSON stdout is silent while a subagent task runs, so without
+  the flag stdout alone is no liveness signal. Do not filter out the hourly
+  `cleanup prune` log line; it resets the watchdog, and that is accepted.
 - **No auto-retry on failure.** A failed ticket goes to `TicketStatus.failed`
   and only retries if the user comments (resume path) or if there's no
   session id yet (re-runs the initial pipeline).

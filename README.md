@@ -341,6 +341,13 @@ poll_interval_seconds: 30
 
 # Max seconds per AI turn before the process is killed (default: 1800).
 turn_timeout_seconds: 1800
+
+# Max seconds an AI turn may go without producing any output on stdout or
+# stderr before the process is killed (default: 1200). This is the idle
+# watchdog: a stalled turn is killed long before the absolute cap above, and
+# the failure comment says which limit fired ('produced no output for Ns'
+# vs 'exceeded Ns in total'). Global only — there is no per-project override.
+turn_idle_timeout_seconds: 1200
 ```
 
 A copy of this example lives at `config.yaml.example` in the repo root.

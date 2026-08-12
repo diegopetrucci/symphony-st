@@ -419,7 +419,7 @@ class TestNewTicketPipeline:
             ),
             mock.patch(
                 "symphony_linear.orchestrator.run_initial",
-                side_effect=OpenCodeTimeout("timeout"),
+                side_effect=OpenCodeTimeout("timeout", reason="exceeded 30s in total"),
             ),
         ):
             orchestrator._new_ticket_pipeline(_make_issue())
@@ -462,6 +462,7 @@ class TestNewTicketPipeline:
                     "timeout",
                     partial_message="Partial work done.",
                     session_id="ses_salvaged",
+                    reason="produced no output for 1200s",
                 ),
             ),
         ):
@@ -503,6 +504,7 @@ class TestNewTicketPipeline:
                 side_effect=OpenCodeTimeout(
                     "timeout",
                     partial_message="I was working on...",
+                    reason="produced no output for 1200s",
                 ),
             ),
         ):
@@ -513,6 +515,9 @@ class TestNewTicketPipeline:
         assert len(timeout_comments) == 1
         assert "Partial output before the timeout" in timeout_comments[0]
         assert "I was working on..." in timeout_comments[0]
+        # The reason distinguishes an idle stall from the absolute cap.
+        assert "produced no output for 1200s" in timeout_comments[0]
+        assert "after 30s" not in timeout_comments[0]
 
     def test_opencode_timeout_comment_unchanged_when_empty_partial(
         self, orchestrator: Orchestrator, linear: FakeLinearClient
@@ -547,6 +552,7 @@ class TestNewTicketPipeline:
                     "timeout",
                     partial_message="",
                     session_id=None,
+                    reason="exceeded 30s in total",
                 ),
             ),
         ):
@@ -556,6 +562,8 @@ class TestNewTicketPipeline:
         timeout_comments = [args[1] for args in post_calls if "timed out" in args[1]]
         assert len(timeout_comments) == 1
         assert "Partial output before the timeout" not in timeout_comments[0]
+        # The single-format comment always carries the reason.
+        assert "exceeded 30s in total" in timeout_comments[0]
 
     def test_opencode_error_advances_last_seen(
         self, orchestrator: Orchestrator, linear: FakeLinearClient
@@ -1016,6 +1024,8 @@ class TestNewTicketProjectConfig:
 
         _, kwargs = mock_run_initial.call_args
         assert kwargs.get("timeout_seconds") == 120
+        # Idle watchdog is global-only: always the global config value.
+        assert kwargs.get("idle_timeout_seconds") == 1200
 
     def test_project_config_error_triggers_setup_error(
         self, orchestrator: Orchestrator, linear: FakeLinearClient
@@ -1548,7 +1558,7 @@ class TestResumePipeline:
             ),
             mock.patch(
                 "symphony_linear.orchestrator.run_resume",
-                side_effect=OpenCodeTimeout("t"),
+                side_effect=OpenCodeTimeout("t", reason="exceeded 30s in total"),
             ),
         ):
             orchestrator._resume_pipeline(ts)
@@ -1570,7 +1580,11 @@ class TestResumePipeline:
             ),
             mock.patch(
                 "symphony_linear.orchestrator.run_resume",
-                side_effect=OpenCodeTimeout("t", partial_message="Continuing work..."),
+                side_effect=OpenCodeTimeout(
+                    "t",
+                    partial_message="Continuing work...",
+                    reason="exceeded 30s in total",
+                ),
             ),
         ):
             orchestrator._resume_pipeline(ts)
@@ -1579,6 +1593,9 @@ class TestResumePipeline:
         assert len(timeout_comments) == 1
         assert "Partial output before the timeout" in timeout_comments[0]
         assert "Continuing work..." in timeout_comments[0]
+        # The reason distinguishes the absolute cap from an idle stall.
+        assert "exceeded 30s in total" in timeout_comments[0]
+        assert "after 30s" not in timeout_comments[0]
 
     def test_resume_timeout_comment_unchanged_when_empty_partial(
         self, orchestrator: Orchestrator, linear: FakeLinearClient
@@ -1594,7 +1611,9 @@ class TestResumePipeline:
             ),
             mock.patch(
                 "symphony_linear.orchestrator.run_resume",
-                side_effect=OpenCodeTimeout("t", partial_message=""),
+                side_effect=OpenCodeTimeout(
+                    "t", partial_message="", reason="produced no output for 1200s"
+                ),
             ),
         ):
             orchestrator._resume_pipeline(ts)
@@ -1753,6 +1772,8 @@ class TestResumeProjectConfig:
 
         _, kwargs = mock_run_resume.call_args
         assert kwargs.get("timeout_seconds") == 90
+        # Idle watchdog is global-only: always the global config value.
+        assert kwargs.get("idle_timeout_seconds") == 1200
 
     def test_project_config_error_on_resume_triggers_setup_error(
         self, orchestrator: Orchestrator, linear: FakeLinearClient

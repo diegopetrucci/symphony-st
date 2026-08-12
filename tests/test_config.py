@@ -87,6 +87,7 @@ class TestLoadConfig:
         assert config.sandbox.hide_paths  # defaults populated
         assert config.poll_interval_seconds == 30
         assert config.turn_timeout_seconds == 1800
+        assert config.turn_idle_timeout_seconds == 1200
         assert config.auto_branch is True  # default
 
     def test_auto_branch_can_be_disabled(self, tmp_path: Path) -> None:

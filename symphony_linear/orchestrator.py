@@ -1299,6 +1299,7 @@ class Orchestrator:
                 workspace_path=workspace_path,
                 prompt=prompt,
                 timeout_seconds=effective_turn_timeout,
+                idle_timeout_seconds=self._config.turn_idle_timeout_seconds,
                 on_subprocess=lambda proc: (self._register_subprocess(tid, proc), None)[
                     1
                 ],
@@ -1310,10 +1311,7 @@ class Orchestrator:
             )
         except OpenCodeTimeout as exc:
             logger.error("OpenCode turn timed out for %s", tid)
-            body = (
-                f"**Symphony error**: The AI turn timed out after "
-                f"{effective_turn_timeout}s."
-            )
+            body = f"**Symphony error**: The AI turn timed out ({exc.reason})."
             if exc.partial_message:
                 body += (
                     f"\n\nPartial output before the timeout:\n\n---\n\n"
@@ -1554,6 +1552,7 @@ class Orchestrator:
                 session_id=ticket_state.session_id,
                 message=rewritten_message,
                 timeout_seconds=effective_turn_timeout,
+                idle_timeout_seconds=self._config.turn_idle_timeout_seconds,
                 on_subprocess=lambda proc: (self._register_subprocess(tid, proc), None)[
                     1
                 ],
@@ -1565,10 +1564,7 @@ class Orchestrator:
             )
         except OpenCodeTimeout as exc:
             logger.error("OpenCode resume timed out for %s", tid)
-            body = (
-                f"**Symphony error**: The AI turn timed out after "
-                f"{effective_turn_timeout}s."
-            )
+            body = f"**Symphony error**: The AI turn timed out ({exc.reason})."
             if exc.partial_message:
                 body += (
                     f"\n\nPartial output before the timeout:\n\n---\n\n"

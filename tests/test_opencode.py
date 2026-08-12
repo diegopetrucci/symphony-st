@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
+import threading
+import time
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -400,21 +403,34 @@ class TestParseStream:
 
 
 class TestExecuteTimeout:
-    """Verify the real timeout path through :func:`_execute` (mocked Popen)."""
+    """Verify the two-tier timeout path through :func:`_execute`.
+
+    Driven by a fake Popen backed by real ``os.pipe()`` fds — never the real
+    ``opencode`` binary or an LLM. The drain threads in ``_execute`` block on
+    readline() until the write ends close, so silent and slowly-writing
+    processes behave realistically, and the short injectable timeouts keep
+    the suite fast.
+    """
 
     @staticmethod
-    def _make_timeout_proc(
-        partial_stdout: bytes, exit_after_kill: int = -9
-    ) -> MagicMock:
-        """Return a mock Popen that simulates a timeout then kill."""
-        proc = MagicMock(spec=subprocess.Popen)
-        # First communicate() raises TimeoutExpired.
-        proc.communicate.side_effect = [
-            subprocess.TimeoutExpired(cmd=["opencode"], timeout=30, output=b""),
-            (partial_stdout, b""),  # second communicate after kill
-        ]
-        proc.returncode = exit_after_kill
-        return proc
+    def _run_initial(
+        proc: "_FakePopen",
+        *,
+        timeout_seconds: int = 10,
+        idle_timeout_seconds: int = 100,
+    ) -> OpenCodeTimeout:
+        """Run run_initial against *proc* and return the raised timeout."""
+        with patch("symphony_linear.opencode.run_in_sandbox", return_value=proc):
+            with pytest.raises(OpenCodeTimeout) as excinfo:
+                run_initial(
+                    workspace_path="/ws",
+                    tmp_path="/ws/tmp",
+                    prompt="do it",
+                    timeout_seconds=timeout_seconds,
+                    idle_timeout_seconds=idle_timeout_seconds,
+                    on_subprocess=lambda p: None,
+                )
+        return excinfo.value
 
     def test_timeout_carries_partial_message_and_session(self) -> None:
         """Timeout via _execute salvages session_id and partial message."""
@@ -430,22 +446,61 @@ class TestExecuteTimeout:
             )
             + "\n"
         ).encode()
-        proc = self._make_timeout_proc(stdout)
-        with patch(
-            "symphony_linear.opencode.run_in_sandbox", return_value=proc
-        ) as mock_sandbox:
-            with pytest.raises(OpenCodeTimeout) as excinfo:
-                run_initial(
-                    workspace_path="/ws",
-                    tmp_path="/ws/tmp",
-                    prompt="do it",
-                    timeout_seconds=30,
-                    on_subprocess=lambda p: None,
-                )
-        assert excinfo.value.session_id == "ses_timeout"
-        assert excinfo.value.partial_message == "I was in the middle of..."
-        # Ensure the sandbox was actually called (not bypassed).
-        mock_sandbox.assert_called_once()
+        proc = _FakePopen(stdout=stdout, exit_code=None)
+        exc = self._run_initial(proc, idle_timeout_seconds=0.2)
+        assert exc.session_id == "ses_timeout"
+        assert exc.partial_message == "I was in the middle of..."
+        assert proc.killed
+        # The pre-buffered output was consumed, then the process went quiet.
+        assert "no output" in exc.reason
+
+    def test_idle_timeout_kills_silent_process(self) -> None:
+        """(a) A process that stops producing output is killed at the idle
+        deadline, with the idle variant of the timeout."""
+        proc = _FakePopen(exit_code=None)  # silent, never exits
+        exc = self._run_initial(proc, idle_timeout_seconds=0.2)
+        assert "no output" in exc.reason
+        assert "total" not in exc.reason
+        assert proc.killed
+
+    def test_activity_resets_idle_deadline_absolute_cap_fires(self) -> None:
+        """(b) A process that keeps writing survives past the idle window
+        and is not killed before the absolute cap.
+
+        The idle window (0.2s) is deliberately shorter than the total budget
+        (0.5s): a writer feeding a line every 10ms keeps pushing the idle
+        deadline, so the kill must come from the absolute cap, not the
+        watchdog."""
+        proc = _FakePopen(exit_code=None)  # never exits on its own
+        stop = threading.Event()
+
+        def writer() -> None:
+            while not stop.is_set():
+                try:
+                    os.write(proc.write_stderr, b"[log] working\n")
+                except OSError:
+                    return  # kill() closed the write end — done
+                time.sleep(0.01)
+
+        writer_thread = threading.Thread(target=writer, daemon=True)
+        writer_thread.start()
+        try:
+            exc = self._run_initial(proc, timeout_seconds=0.5, idle_timeout_seconds=0.2)
+        finally:
+            stop.set()
+            writer_thread.join()
+        assert "total" in exc.reason
+        assert "no output" not in exc.reason
+        assert proc.killed
+
+    def test_absolute_cap_fires_on_silent_process(self) -> None:
+        """(c) The absolute turn_timeout_seconds cap still fires when the
+        idle window is longer than the total budget."""
+        proc = _FakePopen(exit_code=None)
+        exc = self._run_initial(proc, timeout_seconds=0.5, idle_timeout_seconds=100)
+        assert "total" in exc.reason
+        assert "no output" not in exc.reason
+        assert proc.killed
 
     def test_timeout_with_null_line_does_not_mask_timeout(self) -> None:
         """A ``null`` line in partial stdout is skipped; timeout still raised."""
@@ -461,18 +516,10 @@ class TestExecuteTimeout:
             )
             + "\n"
         ).encode()
-        proc = self._make_timeout_proc(stdout)
-        with patch("symphony_linear.opencode.run_in_sandbox", return_value=proc):
-            with pytest.raises(OpenCodeTimeout) as excinfo:
-                run_initial(
-                    workspace_path="/ws",
-                    tmp_path="/ws/tmp",
-                    prompt="do it",
-                    timeout_seconds=30,
-                    on_subprocess=lambda p: None,
-                )
-        assert excinfo.value.session_id == "ses_nl"
-        assert excinfo.value.partial_message == "Working..."
+        proc = _FakePopen(stdout=stdout, exit_code=None)
+        exc = self._run_initial(proc, idle_timeout_seconds=0.2)
+        assert exc.session_id == "ses_nl"
+        assert exc.partial_message == "Working..."
 
     def test_timeout_with_null_part_does_not_mask_timeout(self) -> None:
         """An event with ``"part": null`` does not mask the timeout."""
@@ -490,56 +537,94 @@ class TestExecuteTimeout:
             )
             + "\n"
         ).encode()
-        proc = self._make_timeout_proc(stdout)
-        with patch("symphony_linear.opencode.run_in_sandbox", return_value=proc):
-            with pytest.raises(OpenCodeTimeout) as excinfo:
-                run_initial(
-                    workspace_path="/ws",
-                    tmp_path="/ws/tmp",
-                    prompt="do it",
-                    timeout_seconds=30,
-                    on_subprocess=lambda p: None,
-                )
-        assert excinfo.value.session_id == "ses_np"
+        proc = _FakePopen(stdout=stdout, exit_code=None)
+        exc = self._run_initial(proc, idle_timeout_seconds=0.2)
+        assert exc.session_id == "ses_np"
         # null-part text event contributes nothing, "More text" does.
-        assert excinfo.value.partial_message == "More text"
+        assert exc.partial_message == "More text"
 
     def test_timeout_with_pure_garbage_stdout(self) -> None:
         """Completely unparseable partial stdout still raises timeout."""
-        proc = self._make_timeout_proc(b"not json\n{garbage}")
-        with patch("symphony_linear.opencode.run_in_sandbox", return_value=proc):
-            with pytest.raises(OpenCodeTimeout) as excinfo:
-                run_initial(
-                    workspace_path="/ws",
-                    tmp_path="/ws/tmp",
-                    prompt="do it",
-                    timeout_seconds=30,
-                    on_subprocess=lambda p: None,
-                )
-        assert excinfo.value.session_id is None
-        assert excinfo.value.partial_message == ""
+        proc = _FakePopen(stdout=b"not json\n{garbage}", exit_code=None)
+        exc = self._run_initial(proc, idle_timeout_seconds=0.2)
+        assert exc.session_id is None
+        assert exc.partial_message == ""
 
     def test_timeout_with_no_session_id(self) -> None:
-        ("""Timeout with no sessionID in partial stdout still raises.""",)
+        """Timeout with no sessionID in partial stdout still raises."""
         stdout = (
             json.dumps({"type": "text", "part": {"text": "No session here."}}) + "\n"
         ).encode()
-        proc = self._make_timeout_proc(stdout)
+        proc = _FakePopen(stdout=stdout, exit_code=None)
+        exc = self._run_initial(proc, idle_timeout_seconds=0.2)
+        assert exc.session_id is None
+        assert exc.partial_message == "No session here."
+
+    def test_success_path_returns_parsed_output(self) -> None:
+        """A process that writes valid NDJSON and exits 0 succeeds."""
+        events = [
+            {"type": "step_start", "sessionID": "ses_ok", "part": {}},
+            {"type": "text", "sessionID": "ses_ok", "part": {"text": "all done"}},
+            {"type": "step_finish", "sessionID": "ses_ok", "part": {}},
+        ]
+        stdout = "\n".join(json.dumps(e) for e in events).encode()
+        proc = _FakePopen(stdout=stdout, exit_code=0)
         with patch("symphony_linear.opencode.run_in_sandbox", return_value=proc):
-            with pytest.raises(OpenCodeTimeout) as excinfo:
-                run_initial(
-                    workspace_path="/ws",
-                    tmp_path="/ws/tmp",
-                    prompt="do it",
-                    timeout_seconds=30,
-                    on_subprocess=lambda p: None,
-                )
-        assert excinfo.value.session_id is None
-        assert excinfo.value.partial_message == "No session here."
+            session_id, final_message, _ = run_initial(
+                workspace_path="/ws",
+                tmp_path="/ws/tmp",
+                prompt="do it",
+                timeout_seconds=10,
+                idle_timeout_seconds=10,
+                on_subprocess=lambda p: None,
+            )
+        assert session_id == "ses_ok"
+        assert final_message == "all done"
+        assert proc.killed is False
+
+    def test_process_exit_reaped_promptly_within_idle_window(self) -> None:
+        """A process that exits well inside both windows is reaped as soon
+        as it exits — the watchdog must not sleep out the idle window.
+
+        Regression: the loop used to sleep until the nearer deadline before
+        noticing the exit; on the first iteration that is the full idle
+        window, so a healthy 3-minute turn would not be detected until the
+        window expired (up to 20 minutes late in production). The loop must
+        block on the process instead, waking the moment it exits."""
+        events = [
+            {"type": "step_start", "sessionID": "ses_fast", "part": {}},
+            {"type": "text", "sessionID": "ses_fast", "part": {"text": "fast done"}},
+            {"type": "step_finish", "sessionID": "ses_fast", "part": {}},
+        ]
+        stdout = "\n".join(json.dumps(e) for e in events).encode()
+        proc = _FakePopen(exit_code=None)  # alive at start, exits after 50ms
+
+        def exit_soon() -> None:
+            time.sleep(0.05)
+            os.write(proc.write_stdout, stdout)
+            proc.set_exit_code(0)
+
+        threading.Thread(target=exit_soon, daemon=True).start()
+        started = time.monotonic()
+        with patch("symphony_linear.opencode.run_in_sandbox", return_value=proc):
+            session_id, final_message, _ = run_initial(
+                workspace_path="/ws",
+                tmp_path="/ws/tmp",
+                prompt="do it",
+                timeout_seconds=30,
+                idle_timeout_seconds=5,
+                on_subprocess=lambda p: None,
+            )
+        elapsed = time.monotonic() - started
+        assert elapsed < 1.0, (
+            f"_execute took {elapsed:.2f}s — the exit was not noticed promptly"
+        )
+        assert session_id == "ses_fast"
+        assert final_message == "fast done"
 
 
 class TestOpenCodeTimeoutAttributes:
-    """Verify OpenCodeTimeout carries partial_message and session_id."""
+    """Verify OpenCodeTimeout carries partial_message, session_id, and reason."""
 
     def test_timeout_with_partial_output(self) -> None:
         """Full partial output is captured as attributes."""
@@ -547,16 +632,19 @@ class TestOpenCodeTimeoutAttributes:
             "timed out",
             partial_message="Hello\n\n*Running command*",
             session_id="ses_partial",
+            reason="produced no output for 1200s",
         )
         assert exc.partial_message == "Hello\n\n*Running command*"
         assert exc.session_id == "ses_partial"
+        assert exc.reason == "produced no output for 1200s"
         assert "timed out" in str(exc)
 
     def test_timeout_with_no_partial_output(self) -> None:
-        """When partial_message is empty (default), attributes are empty/None."""
-        exc = OpenCodeTimeout("timed out")
+        """partial_message and session_id default to empty/None."""
+        exc = OpenCodeTimeout("timed out", reason="exceeded 1800s in total")
         assert exc.partial_message == ""
         assert exc.session_id is None
+        assert exc.reason == "exceeded 1800s in total"
 
     def test_timeout_with_message_only_no_session(self) -> None:
         """Partial text without a sessionID event yields a message but no session."""
@@ -564,9 +652,96 @@ class TestOpenCodeTimeoutAttributes:
             "timed out",
             partial_message="Partial text",
             session_id=None,
+            reason="produced no output for 1200s",
         )
         assert exc.partial_message == "Partial text"
         assert exc.session_id is None
+
+    def test_timeout_requires_reason(self) -> None:
+        """reason is a required keyword argument."""
+        with pytest.raises(TypeError):
+            OpenCodeTimeout("timed out")  # type: ignore[call-arg]
+
+    def test_timeout_carries_reason(self) -> None:
+        """The reason distinguishes idle stalls from the absolute cap."""
+        exc = OpenCodeTimeout("timed out", reason="produced no output for 1200s")
+        assert exc.reason == "produced no output for 1200s"
+
+
+# ---------------------------------------------------------------------------
+# Unit: --print-logs flag argv construction
+# ---------------------------------------------------------------------------
+
+
+class TestPrintLogsFlag:
+    """--print-logs must be on every opencode run command line: it mirrors
+    OpenCode's internal log to stderr, which is the only liveness signal
+    while a subagent task runs."""
+
+    @staticmethod
+    def _make_fake_popen() -> _FakePopen:
+        events = [
+            {"type": "step_start", "sessionID": "ses_test", "part": {}},
+            {"type": "text", "sessionID": "ses_test", "part": {"text": "ok"}},
+            {"type": "step_finish", "sessionID": "ses_test", "part": {}},
+        ]
+        stdout = "\n".join(json.dumps(e) for e in events).encode()
+        return _FakePopen(stdout=stdout, exit_code=0)
+
+    def test_run_initial_has_print_logs(self) -> None:
+        fake_proc = self._make_fake_popen()
+        with patch(
+            "symphony_linear.opencode.run_in_sandbox", return_value=fake_proc
+        ) as mock_sandbox:
+            run_initial(
+                workspace_path="/ws",
+                tmp_path="/ws/tmp",
+                prompt="hello",
+                timeout_seconds=60,
+                idle_timeout_seconds=60,
+                on_subprocess=lambda p: None,
+            )
+        cmd = mock_sandbox.call_args.kwargs["cmd"]
+        assert "--print-logs" in cmd
+
+    def test_run_resume_has_print_logs(self) -> None:
+        fake_proc = self._make_fake_popen()
+        with patch(
+            "symphony_linear.opencode.run_in_sandbox", return_value=fake_proc
+        ) as mock_sandbox:
+            run_resume(
+                workspace_path="/ws",
+                tmp_path="/ws/tmp",
+                session_id="ses_x",
+                message="continue",
+                timeout_seconds=60,
+                idle_timeout_seconds=60,
+                on_subprocess=lambda p: None,
+            )
+        cmd = mock_sandbox.call_args.kwargs["cmd"]
+        assert "--print-logs" in cmd
+
+    def test_print_logs_does_not_leak_into_stdout_parsing(self) -> None:
+        """Log output must not appear on stdout: NDJSON parsing is unaffected."""
+        events = [
+            {"type": "step_start", "sessionID": "ses_p", "part": {}},
+            {"type": "text", "sessionID": "ses_p", "part": {"text": "clean"}},
+        ]
+        stdout = "\n".join(json.dumps(e) for e in events).encode()
+        proc = _FakePopen(
+            stdout=stdout, stderr=b"[log] 12:00:00 something\n", exit_code=0
+        )
+        with patch("symphony_linear.opencode.run_in_sandbox", return_value=proc):
+            session_id, final_message, _ = run_initial(
+                workspace_path="/ws",
+                tmp_path="/ws/tmp",
+                prompt="hello",
+                timeout_seconds=60,
+                idle_timeout_seconds=60,
+                on_subprocess=lambda p: None,
+            )
+        assert session_id == "ses_p"
+        assert final_message == "clean"
 
 
 # ---------------------------------------------------------------------------
@@ -577,7 +752,7 @@ class TestOpenCodeTimeoutAttributes:
 class TestFilesArgv:
     """Verify --file flags are placed correctly in the constructed command."""
 
-    def _make_fake_popen(self) -> MagicMock:
+    def _make_fake_popen(self) -> _FakePopen:
         """Return a mock Popen with valid NDJSON stdout and exit code 0."""
         events = [
             {"type": "step_start", "sessionID": "ses_test", "part": {}},
@@ -585,10 +760,7 @@ class TestFilesArgv:
             {"type": "step_finish", "sessionID": "ses_test", "part": {}},
         ]
         stdout = "\n".join(json.dumps(e) for e in events).encode()
-        proc = MagicMock(spec=subprocess.Popen)
-        proc.returncode = 0
-        proc.communicate.return_value = (stdout, b"")
-        return proc
+        return _FakePopen(stdout=stdout, exit_code=0)
 
     def test_run_initial_no_files(self) -> None:
         """When files is None, no --file flags appear."""
@@ -601,6 +773,7 @@ class TestFilesArgv:
                 tmp_path="/ws/tmp",
                 prompt="hello",
                 timeout_seconds=60,
+                idle_timeout_seconds=60,
                 on_subprocess=lambda p: None,
             )
         cmd = mock_sandbox.call_args.kwargs["cmd"]
@@ -617,6 +790,7 @@ class TestFilesArgv:
                 tmp_path="/ws/tmp",
                 prompt="hello",
                 timeout_seconds=60,
+                idle_timeout_seconds=60,
                 on_subprocess=lambda p: None,
                 files=[],
             )
@@ -634,6 +808,7 @@ class TestFilesArgv:
                 tmp_path="/ws/tmp",
                 prompt="hello",
                 timeout_seconds=60,
+                idle_timeout_seconds=60,
                 on_subprocess=lambda p: None,
                 files=["/tmp/foo.txt"],
             )
@@ -652,6 +827,7 @@ class TestFilesArgv:
                 tmp_path="/ws/tmp",
                 prompt="hello",
                 timeout_seconds=60,
+                idle_timeout_seconds=60,
                 on_subprocess=lambda p: None,
                 files=["/a.txt", "/b.txt"],
             )
@@ -673,6 +849,7 @@ class TestFilesArgv:
                 tmp_path="/ws/tmp",
                 prompt="hello",
                 timeout_seconds=60,
+                idle_timeout_seconds=60,
                 on_subprocess=lambda p: None,
                 files=["/x.txt"],
             )
@@ -693,6 +870,7 @@ class TestFilesArgv:
                 session_id="ses_x",
                 message="continue",
                 timeout_seconds=60,
+                idle_timeout_seconds=60,
                 on_subprocess=lambda p: None,
             )
         cmd = mock_sandbox.call_args.kwargs["cmd"]
@@ -710,6 +888,7 @@ class TestFilesArgv:
                 session_id="ses_x",
                 message="continue",
                 timeout_seconds=60,
+                idle_timeout_seconds=60,
                 on_subprocess=lambda p: None,
                 files=["/f1.txt", "/f2.txt"],
             )
@@ -733,6 +912,7 @@ class TestFilesArgv:
                 session_id="ses_x",
                 message="continue",
                 timeout_seconds=60,
+                idle_timeout_seconds=60,
                 on_subprocess=lambda p: None,
                 files=["/f.txt"],
             )
@@ -759,6 +939,7 @@ class TestRunResumeGuard:
                 session_id=session_id,
                 message="continue",
                 timeout_seconds=60,
+                idle_timeout_seconds=60,
                 on_subprocess=lambda p: None,
             )
 
@@ -772,17 +953,14 @@ class TestTmpPathForwarded:
     """run_initial / run_resume pass tmp_path through to run_in_sandbox."""
 
     @staticmethod
-    def _make_fake_popen() -> MagicMock:
+    def _make_fake_popen() -> _FakePopen:
         events = [
             {"type": "step_start", "sessionID": "ses_test", "part": {}},
             {"type": "text", "sessionID": "ses_test", "part": {"text": "ok"}},
             {"type": "step_finish", "sessionID": "ses_test", "part": {}},
         ]
         stdout = "\n".join(json.dumps(e) for e in events).encode()
-        proc = MagicMock(spec=subprocess.Popen)
-        proc.returncode = 0
-        proc.communicate.return_value = (stdout, b"")
-        return proc
+        return _FakePopen(stdout=stdout, exit_code=0)
 
     def test_run_initial_forwards_tmp_path(self) -> None:
         fake_proc = self._make_fake_popen()
@@ -793,6 +971,7 @@ class TestTmpPathForwarded:
                 workspace_path="/ws",
                 prompt="hello",
                 timeout_seconds=60,
+                idle_timeout_seconds=60,
                 on_subprocess=lambda p: None,
                 tmp_path="/ws/tmp",
             )
@@ -808,6 +987,7 @@ class TestTmpPathForwarded:
                 session_id="ses_x",
                 message="continue",
                 timeout_seconds=60,
+                idle_timeout_seconds=60,
                 on_subprocess=lambda p: None,
                 tmp_path="/ws/tmp",
             )
@@ -815,8 +995,139 @@ class TestTmpPathForwarded:
 
 
 # ---------------------------------------------------------------------------
+# Unit: OPENCODE_PERMISSION is injected into the sandbox env
+# ---------------------------------------------------------------------------
+
+
+class TestOpenCodePermissionEnv:
+    """Every turn must pass OPENCODE_PERMISSION to run_in_sandbox so the three
+    permissions that default to 'ask' (external_directory, doom_loop, read)
+    are pre-answered. Without it, an ask raised by a subagent session is
+    never replied to (OpenCode's auto-approve is filtered to the top-level
+    session) and the turn hangs until the daemon's absolute timeout."""
+
+    @staticmethod
+    def _make_fake_popen() -> _FakePopen:
+        events = [
+            {"type": "step_start", "sessionID": "ses_test", "part": {}},
+            {"type": "text", "sessionID": "ses_test", "part": {"text": "ok"}},
+            {"type": "step_finish", "sessionID": "ses_test", "part": {}},
+        ]
+        stdout = "\n".join(json.dumps(e) for e in events).encode()
+        return _FakePopen(stdout=stdout, exit_code=0)
+
+    @staticmethod
+    def _assert_permission(mock_sandbox: MagicMock) -> None:
+        env = mock_sandbox.call_args.kwargs["env"]
+        assert "OPENCODE_PERMISSION" in env
+        permission = json.loads(env["OPENCODE_PERMISSION"])
+        assert permission == {
+            "external_directory": "allow",
+            "doom_loop": "allow",
+            "read": "allow",
+        }
+
+    def test_run_initial_injects_open_code_permission(self) -> None:
+        fake_proc = self._make_fake_popen()
+        with patch(
+            "symphony_linear.opencode.run_in_sandbox", return_value=fake_proc
+        ) as mock_sandbox:
+            run_initial(
+                workspace_path="/ws",
+                tmp_path="/ws/tmp",
+                prompt="hello",
+                timeout_seconds=60,
+                idle_timeout_seconds=60,
+                on_subprocess=lambda p: None,
+            )
+        self._assert_permission(mock_sandbox)
+
+    def test_run_resume_injects_open_code_permission(self) -> None:
+        fake_proc = self._make_fake_popen()
+        with patch(
+            "symphony_linear.opencode.run_in_sandbox", return_value=fake_proc
+        ) as mock_sandbox:
+            run_resume(
+                workspace_path="/ws",
+                tmp_path="/ws/tmp",
+                session_id="ses_x",
+                message="continue",
+                timeout_seconds=60,
+                idle_timeout_seconds=60,
+                on_subprocess=lambda p: None,
+            )
+        self._assert_permission(mock_sandbox)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+class _FakePopen:
+    """Minimal Popen stand-in backed by real ``os.pipe()`` fds.
+
+    The drain threads in ``_execute`` block on readline() until the write
+    ends are closed, so silent and slowly-writing processes behave like the
+    real thing without launching any subprocess or LLM. ``write_stdout`` /
+    ``write_stderr`` stay open for the test to feed more output (a writer
+    thread); ``kill()`` / ``set_exit_code()`` close them so the drains see
+    EOF. ``wait()`` blocks until the process exits or the timeout expires,
+    matching the real Popen semantics the watchdog loop depends on.
+    """
+
+    def __init__(
+        self,
+        stdout: bytes = b"",
+        stderr: bytes = b"",
+        exit_code: int | None = None,
+    ) -> None:
+        read_fd, self.write_stdout = os.pipe()
+        self.stdout = os.fdopen(read_fd, "rb")
+        read_fd, self.write_stderr = os.pipe()
+        self.stderr = os.fdopen(read_fd, "rb")
+        self._exit_code = exit_code
+        self._exited = threading.Event()
+        self.killed = False
+        if stdout:
+            os.write(self.write_stdout, stdout)
+        if stderr:
+            os.write(self.write_stderr, stderr)
+        if exit_code is not None:
+            self._close_write_ends()
+            self._exited.set()
+
+    def set_exit_code(self, code: int) -> None:
+        """Exit the process with *code*: wake wait() and close the pipes."""
+        self._exit_code = code
+        self._close_write_ends()
+        self._exited.set()
+
+    def _close_write_ends(self) -> None:
+        for fd in (self.write_stdout, self.write_stderr):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def poll(self) -> int | None:
+        return self._exit_code
+
+    def kill(self) -> None:
+        self.killed = True
+        self._exit_code = -9
+        self._close_write_ends()
+        self._exited.set()
+
+    def wait(self, timeout: float | None = None) -> int:
+        if not self._exited.wait(timeout):
+            raise subprocess.TimeoutExpired(cmd=[], timeout=timeout)
+        assert self._exit_code is not None
+        return self._exit_code
+
+    @property
+    def returncode(self) -> int | None:
+        return self._exit_code
 
 
 def _load_fixture_events(

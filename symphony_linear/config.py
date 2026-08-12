@@ -189,6 +189,14 @@ class AppConfig(BaseModel):
         30, gt=0, description="Seconds between poll cycles"
     )
     turn_timeout_seconds: int = Field(1800, gt=0, description="Max seconds per AI turn")
+    turn_idle_timeout_seconds: int = Field(
+        1200,
+        gt=0,
+        description=(
+            "Max seconds an AI turn may go without producing output on "
+            "stdout or stderr before the process is killed"
+        ),
+    )
     auto_branch: bool = Field(
         True,
         description=(
