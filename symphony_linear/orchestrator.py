@@ -60,6 +60,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _SHUTDOWN_GRACE_SECONDS = 5
+_MAX_INTERRUPTED_TURNS = 3
 _RESTART_NOTICE_BODY = (
     "**Symphony**: Restarted before setup completed. "
     "Picking this ticket up again on the next poll."
@@ -234,6 +235,12 @@ class Orchestrator:
     # ==================================================================
 
     def _recover_state(self) -> None:
+        # Only bootstrapping entries are handled at startup: their workspaces
+        # may be half-prepared, so the entry is dropped and the ticket is
+        # picked up as a fresh one on the first tick.  Working tickets are
+        # left alone — run() ticks immediately after this, and tick step 4
+        # re-runs interrupted turns there, where the issue list, the QA skip,
+        # and step-3 cleanup are all available.
         for ticket_state in list(self._state.tickets):
             if ticket_state.status == TicketStatus.bootstrapping:
                 logger.info(
@@ -255,44 +262,147 @@ class Orchestrator:
                             ticket_state.ticket_id,
                         )
                 self._state.remove(ticket_state.ticket_id)
-            elif ticket_state.status == TicketStatus.working:
-                logger.info(
-                    "Recovery: found orphaned working %s", ticket_state.ticket_id
-                )
-                self._recover_working_ticket(ticket_state)
         self._state.save()
         logger.info("Startup recovery complete")
 
-    def _recover_working_ticket(self, ticket_state: TicketState) -> None:
+    def _rerun_interrupted_turn(self, ticket_state: TicketState, issue: Issue) -> None:
+        """Re-run a turn interrupted by a restart or pipeline-thread death.
+
+        Called from tick step 4 for tickets stuck in ``working``.  With a
+        session id and pending human comments the interrupted resume is
+        re-run; without a session id the initial turn restarts (carrying any
+        pending comments into the prompt); with a session id but nothing
+        pending there is nothing to replay, so the ticket is parked in
+        needs_input.  After ``_MAX_INTERRUPTED_TURNS`` consecutive
+        interruptions the daemon gives up and parks the ticket.  The re-run
+        branches do not transition the tracker themselves: both pipelines
+        transition to In Progress.
+        """
         tid = ticket_state.ticket_id
         if self._is_cancelled(tid):
             return
-        if ticket_state.metadata_comment_id:
-            recovery_msg = (
-                "**Symphony**: Daemon restarted while I was working on this. "
-                "Reply to continue the conversation, or "
-                f"{self._tracker.human_trigger_description()} to stop."
+
+        if ticket_state.interrupted_turns >= _MAX_INTERRUPTED_TURNS:
+            self._park_interrupted_turn(
+                ticket_state,
+                (
+                    "**Symphony**: I re-ran the last turn "
+                    f"{_MAX_INTERRUPTED_TURNS} times and it kept getting "
+                    "interrupted, so I stopped. Reply to continue, or "
+                    f"{self._tracker.human_trigger_description()} to stop."
+                ),
             )
-            try:
-                self._tracker.post_comment(tid, recovery_msg, "restart")
-            except TrackerError:
-                logger.exception("Failed to post recovery comment for %s", tid)
-                return
+            return
+
+        try:
+            pending = self._fetch_pending_human_comments(
+                tid, ticket_state.last_seen_comment_id
+            )
+        except Exception:
+            # A flaky fetch must not be mistaken for "nothing pending":
+            # parking the ticket would advance last_seen past the
+            # unconsumed human comment.  Leave the ticket working and let
+            # the next tick retry.
+            logger.warning(
+                "Recovery: failed to fetch pending comments for %s — "
+                "leaving the ticket working",
+                tid,
+                exc_info=True,
+            )
+            return
+
+        if ticket_state.session_id is not None and pending is None:
+            self._park_interrupted_turn(
+                ticket_state,
+                (
+                    "**Symphony**: Daemon restarted while I was working on "
+                    "this, but I have nothing to re-run. Reply to continue, "
+                    "or "
+                    f"{self._tracker.human_trigger_description()} to stop."
+                ),
+            )
+            return
+
+        # A real re-run: count it and persist before starting, so a death
+        # during the re-run itself is attributed to the interruption streak.
+        with self._state_lock:
+            ticket_state.interrupted_turns += 1
+            ticket_state.updated_at = _iso_now()
+            self._state.upsert(ticket_state)
+            self._state.save()
+        attempt = ticket_state.interrupted_turns
+
+        if self._is_cancelled(tid):
+            return
+
+        if ticket_state.session_id is not None:
+            self._post_comment_safe(
+                tid,
+                (
+                    "**Symphony**: Restarted — re-running the last turn "
+                    f"(attempt {attempt} of {_MAX_INTERRUPTED_TURNS}), "
+                    "no reply needed."
+                ),
+                kind="restart",
+            )
+            # pending is not None here (the nothing-to-replay branch returned
+            # above); replay_message being set is what makes the resume a
+            # recovery re-run rather than a fresh human-input turn.
+            self._resume_pipeline(ticket_state, replay_message=pending)
+        else:
+            self._post_comment_safe(
+                tid,
+                (
+                    "**Symphony**: Restarted before the first turn finished — "
+                    f"starting it again (attempt {attempt} of "
+                    f"{_MAX_INTERRUPTED_TURNS}), no reply needed."
+                ),
+                kind="restart",
+            )
+            self._new_ticket_pipeline(issue, pending, recovering=True)
+        logger.info("Recovery: re-running interrupted turn for %s", tid)
+
+    def _park_interrupted_turn(self, ticket_state: TicketState, message: str) -> None:
+        """Post *message*, move the ticket to needs_input, and baseline comments.
+
+        Used by the give-up and nothing-to-replay branches.  The
+        ``interrupted_turns`` counter is deliberately left untouched: give-up
+        does not reset it (a stale-comment replay stays capped), and the
+        nothing-to-replay branch never had anything to count.
+        """
+        tid = ticket_state.ticket_id
+        if self._is_cancelled(tid):
+            return
+        comment = self._post_comment_safe(
+            tid, message, return_comment=True, kind="restart"
+        )
         if self._is_cancelled(tid):
             return
         try:
             self._tracker.transition_to(tid, TransitionTarget.needs_input)
-        except TrackerError:
-            logger.exception("Failed to transition %s during recovery", tid)
-            return
-        if self._is_cancelled(tid):
-            return
+        except Exception:
+            logger.exception(
+                "Failed to transition %s to '%s' during restart recovery",
+                tid,
+                TransitionTarget.needs_input.value,
+            )
         with self._state_lock:
+            # Advance last_seen best-effort so the triggering comment is not
+            # re-seen as new on the next tick (a replay would reset the
+            # interruption counter and could loop forever).  When the comment
+            # post fails, always try the baseline; never clobber a good value
+            # with a failed baseline (None).
+            if comment is not None:
+                ticket_state.last_seen_comment_id = comment.id
+            else:
+                baseline = self._baseline_comment_id(tid)
+                if baseline is not None:
+                    ticket_state.last_seen_comment_id = baseline
             ticket_state.status = TicketStatus.needs_input
             ticket_state.updated_at = _iso_now()
             self._state.upsert(ticket_state)
             self._state.save()
-        logger.info("Recovery: %s transitioned to needs_input", tid)
+        logger.info("Recovery: %s parked in needs_input", tid)
 
     # ==================================================================
     # Tick
@@ -560,17 +670,37 @@ class Orchestrator:
                 # human comments, so QA tickets naturally fall through here — only
                 # tickets with actual new human comments will get an agent turn.
                 # _reconcile_serve on the next tick kills the serve when the ticket
-                # leaves QA.  Recovery, however, is unconditional (no comment gating),
-                # so we skip it for QA tickets to avoid clobbering the QA state.
+                # leaves QA.  Recovery of a working ticket, however, is unconditional
+                # (no comment gating), so it is skipped when the ticket is in QA, no
+                # longer triggered, or cleanup-refused — those tickets are left alone.
 
                 if st == TicketStatus.failed and ticket_state.setup_error is not None:
                     continue
                 if st == TicketStatus.working:
                     fetched = issues_by_id.get(tid)
-                    if fetched is not None and self._tracker.is_in_qa(fetched):
+                    if fetched is None:
+                        # Not in the trigger list: step 3 handles cleanup (or a
+                        # transient fetch failure resolves on the next tick).  Do
+                        # not schedule a re-run for a ticket we may be dropping.
+                        logger.debug(
+                            "Skipping recovery for working ticket %s: not triggered",
+                            tid,
+                        )
+                        continue
+                    if ticket_state.cleanup_refused_state is not None:
+                        # Step-3 cleanup was refused for a dirty workspace; leave
+                        # the entry alone until the human moves the ticket.
+                        logger.debug(
+                            "Skipping recovery for working ticket %s: cleanup refused",
+                            tid,
+                        )
+                        continue
+                    if self._tracker.is_in_qa(fetched):
                         logger.debug("Skipping recovery for working QA ticket %s", tid)
                         continue
-                    self._schedule_task(tid, self._recover_working_ticket, ticket_state)
+                    self._schedule_task(
+                        tid, self._rerun_interrupted_turn, ticket_state, fetched
+                    )
                 elif st in (TicketStatus.needs_input, TicketStatus.failed):
                     if ticket_state.session_id:
                         self._schedule_task(tid, self._resume_pipeline, ticket_state)
@@ -1006,12 +1136,19 @@ class Orchestrator:
     # ==================================================================
 
     def _new_ticket_pipeline(
-        self, issue: Issue, extra_context: str | None = None
+        self,
+        issue: Issue,
+        extra_context: str | None = None,
+        *,
+        recovering: bool = False,
     ) -> None:
         """Run a full initial turn for *issue*.
 
         *extra_context* is optional pre-formatted text (e.g. pending human
         comments that triggered a rerun) appended to the initial prompt.
+        *recovering* marks a re-run of an interrupted first turn: the
+        ``interrupted_turns`` streak is carried over instead of starting
+        fresh.
         """
         tid = issue.id
         logger.info("New ticket pipeline starting for %s (%s)", tid, issue.identifier)
@@ -1050,6 +1187,13 @@ class Orchestrator:
             branch="",  # will be updated after loading project config
             last_seen_comment_id=(
                 previous_state.last_seen_comment_id if previous_state else None
+            ),
+            # This fresh state would wipe the interruption streak; carry it
+            # over when the pipeline is a recovery re-run, else start clean.
+            interrupted_turns=(
+                previous_state.interrupted_turns
+                if previous_state is not None and recovering
+                else 0
             ),
             status=TicketStatus.bootstrapping,
         )
@@ -1285,6 +1429,10 @@ class Orchestrator:
         ticket_state.status = TicketStatus.working
         # Agent takes a turn — re-arm the dirty-workspace guard.
         ticket_state.cleanup_refused_state = None
+        if not recovering:
+            # A turn started from genuinely new input ends any interruption
+            # streak.
+            ticket_state.interrupted_turns = 0
         with self._state_lock:
             self._state.upsert(ticket_state)
             self._state.save()
@@ -1415,33 +1563,47 @@ class Orchestrator:
     # Resume pipeline
     # ==================================================================
 
-    def _resume_pipeline(self, ticket_state: TicketState) -> None:
+    def _resume_pipeline(
+        self, ticket_state: TicketState, *, replay_message: str | None = None
+    ) -> None:
+        """Resume an existing OpenCode session with new human comments.
+
+        When *replay_message* is provided, the pipeline is a recovery re-run
+        of an interrupted turn: the comment fetch and the new-comment gate
+        are skipped entirely and *replay_message* is fed to the model as-is
+        (the caller already fetched and formatted it), and the
+        ``interrupted_turns`` streak is preserved instead of reset.  Without
+        it, the pipeline is a normal turn started by a genuine human comment.
+        """
         tid = ticket_state.ticket_id
         logger.debug("Resume pipeline tick for %s", tid)
 
-        try:
-            new_comments = self._tracker.list_comments_since(
+        if replay_message is None:
+            try:
+                new_comments = self._tracker.list_comments_since(
+                    tid,
+                    ticket_state.last_seen_comment_id,
+                )
+            except Exception:
+                logger.exception("Failed to fetch comments for %s", tid)
+                return
+
+            human_comments = [c for c in new_comments if not is_bot_comment(c.body)]
+            if not human_comments:
+                logger.debug("No new human comments on %s", tid)
+                return
+
+            if self._is_cancelled(tid):
+                return
+
+            logger.info(
+                "Resume pipeline starting for %s (%d new human comment(s))",
                 tid,
-                ticket_state.last_seen_comment_id,
+                len(human_comments),
             )
-        except Exception:
-            logger.exception("Failed to fetch comments for %s", tid)
-            return
-
-        human_comments = [c for c in new_comments if not is_bot_comment(c.body)]
-        if not human_comments:
-            logger.debug("No new human comments on %s", tid)
-            return
-
-        if self._is_cancelled(tid):
-            return
-
-        logger.info(
-            "Resume pipeline starting for %s (%d new human comment(s))",
-            tid,
-            len(human_comments),
-        )
-        message = _format_comments_message(human_comments)
+            message = _format_comments_message(human_comments)
+        else:
+            message = replay_message
 
         # --- Process attachments ---
         # ensure_attachments_dir applies the path-containment security check
@@ -1534,6 +1696,10 @@ class Orchestrator:
             ticket_state.status = TicketStatus.working
             # Agent takes a turn — re-arm the dirty-workspace guard.
             ticket_state.cleanup_refused_state = None
+            if replay_message is None:
+                # A turn started from genuinely new input ends any
+                # interruption streak.
+                ticket_state.interrupted_turns = 0
             ticket_state.updated_at = _iso_now()
             self._state.upsert(ticket_state)
             self._state.save()
@@ -1743,24 +1909,37 @@ class Orchestrator:
             )
         return None
 
-    def _pending_human_comments(
+    def _fetch_pending_human_comments(
         self, issue_id: str, last_seen: str | None
     ) -> str | None:
         """Return formatted new human comments since *last_seen*, or None.
 
         Bot comments (``is_bot_comment``) are filtered out.  Returns None
-        both when there are no new human comments and when the tracker call
-        fails, so callers can gate a turn on the result directly.
+        when there are no new human comments; tracker failures propagate, so
+        callers that must distinguish "nothing pending" from "fetch failed"
+        (e.g. restart recovery) can catch and act accordingly.
         """
-        try:
-            comments = self._tracker.list_comments_since(issue_id, last_seen)
-        except Exception:
-            logger.exception("Failed to list comments for %s", issue_id)
-            return None
+        comments = self._tracker.list_comments_since(issue_id, last_seen)
         human_comments = [c for c in comments if not is_bot_comment(c.body)]
         if not human_comments:
             return None
         return _format_comments_message(human_comments)
+
+    def _pending_human_comments(
+        self, issue_id: str, last_seen: str | None
+    ) -> str | None:
+        """Return formatted new human comments since *last_seen*, or None.
+
+        Swallowing wrapper over :meth:`_fetch_pending_human_comments`:
+        returns None both when there are no new human comments and when the
+        tracker call fails, so callers can gate a turn on the result
+        directly.
+        """
+        try:
+            return self._fetch_pending_human_comments(issue_id, last_seen)
+        except Exception:
+            logger.exception("Failed to list comments for %s", issue_id)
+            return None
 
     # ==================================================================
     # Signal handling and shutdown

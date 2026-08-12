@@ -3131,7 +3131,7 @@ class TestTick:
 
     # --- Correction 4: broad QA gate in step 2 only ---
     # Step 4 no longer has a broad QA gate; _resume_pipeline falls through
-    # and handles its own early-return. _recover_working_ticket is still
+    # and handles its own early-return. _rerun_interrupted_turn is still
     # skipped for QA tickets (it has no comment gating).
 
     def test_working_ticket_in_qa_state_not_scheduled(
@@ -3140,7 +3140,7 @@ class TestTick:
         state_mgr: StateManager,
         linear: FakeLinearClient,
     ) -> None:
-        """status=working + linear_state=qa_state → _recover_working_ticket NOT scheduled."""
+        """status=working + linear_state=qa_state → _rerun_interrupted_turn NOT scheduled."""
         config = _make_config(tmp_path, linear={"qa_state": "In Review"})
         orch = Orchestrator(
             config=config,
@@ -3166,7 +3166,7 @@ class TestTick:
         with mock.patch(
             "symphony_linear.orchestrator.start_serve", return_value=_make_fake_proc()
         ):
-            with mock.patch.object(orch, "_recover_working_ticket") as m_recover:
+            with mock.patch.object(orch, "_rerun_interrupted_turn") as m_recover:
                 orch._tick()
                 time.sleep(0.2)
 
@@ -3495,18 +3495,21 @@ class TestStartupRecovery:
         orchestrator._recover_state()
         assert orchestrator._state.get("ticket-1") is None
 
-    def test_working_posted_and_transitioned(
+    def test_working_left_alone_by_recover_state(
         self, orchestrator: Orchestrator, linear: FakeLinearClient
     ) -> None:
+        """_recover_state only drops bootstrapping; working tickets are left alone.
+
+        Interrupted working turns are re-run by tick step 4, where the issue
+        list and the QA/cleanup gates are available.
+        """
         self._add_working(orchestrator)
         orchestrator._recover_state()
-        assert len(linear.calls.get("post_comment", [])) >= 1
-        assert ("ticket-1", "Needs Input") in linear.calls.get(
-            "transition_to_state", []
-        )
+        assert "post_comment" not in linear.calls
+        assert "transition_to_state" not in linear.calls
         ts = orchestrator._state.get("ticket-1")
         assert ts is not None
-        assert ts.status == TicketStatus.needs_input
+        assert ts.status == TicketStatus.working
 
     def test_bootstrapping_with_metadata_edits_comment(
         self,
@@ -3574,6 +3577,473 @@ class TestStartupRecovery:
         orchestrator._recover_state()
         # Must not have crashed, and state must still be removed.
         assert orchestrator._state.get("ticket-1") is None
+
+
+# ---------------------------------------------------------------------------
+# Interrupted-turn re-run (restart recovery)
+# ---------------------------------------------------------------------------
+
+
+class TestRerunInterruptedTurn:
+    def _add_working(self, orchestrator: Orchestrator, **overrides: Any) -> TicketState:
+        defaults: dict[str, Any] = {
+            "ticket_id": "ticket-1",
+            "ticket_identifier": "TEAM-1",
+            "repo_url": "https://github.com/org/repo.git",
+            "workspace_path": "/tmp/ws/TEAM-1",
+            "branch": "feature/test",
+            "status": TicketStatus.working,
+            "session_id": "ses-abc",
+            "last_seen_comment_id": "cmt-seen-1",
+        }
+        defaults.update(overrides)
+        ts = TicketState(**defaults)
+        orchestrator._state.upsert(ts)
+        return ts
+
+    def test_resume_rerun_with_pending_comments(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """status=working + session + pending comments → counter++, resume re-run.
+
+        The re-run goes through the real _resume_pipeline with a replay
+        message: the new-comment gate is skipped and run_resume receives the
+        pending comment text.
+        """
+        self._add_working(orchestrator)
+        linear.set_response(
+            "list_comments_since",
+            [_make_comment("cmt-new", "please continue")],
+        )
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config",
+                return_value=ProjectConfig(),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.run_resume", return_value=("Done!", None)
+            ) as m_run_resume,
+        ):
+            orchestrator._rerun_interrupted_turn(
+                orchestrator._state.get("ticket-1"), _make_issue()
+            )
+        ts = orchestrator._state.get("ticket-1")
+        assert ts is not None
+        assert ts.interrupted_turns == 1
+        assert ts.status == TicketStatus.needs_input  # re-run completed
+        m_run_resume.assert_called_once()
+        msg = (
+            m_run_resume.call_args.kwargs.get("message") or m_run_resume.call_args[0][2]
+        )
+        assert "please continue" in msg
+        posted = [b for _, b in linear.calls.get("post_comment", [])]
+        assert any(
+            "re-running the last turn" in b and "attempt 1 of 3" in b for b in posted
+        )
+        assert not any("Reply to continue" in b for b in posted)
+
+    def test_resume_rerun_mocked_pipeline(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """_resume_pipeline is invoked with the precomputed replay message."""
+        self._add_working(orchestrator)
+        pending_comment = _make_comment("cmt-new", "please continue")
+        linear.set_response("list_comments_since", [pending_comment])
+        with mock.patch.object(orchestrator, "_resume_pipeline") as m_resume:
+            orchestrator._rerun_interrupted_turn(
+                orchestrator._state.get("ticket-1"), _make_issue()
+            )
+        ts = orchestrator._state.get("ticket-1")
+        assert ts is not None
+        assert ts.interrupted_turns == 1
+        m_resume.assert_called_once_with(
+            ts, replay_message=_format_comments_message([pending_comment])
+        )
+
+    def test_recovery_fetch_failure_leaves_ticket_working(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """A flaky comment fetch must not be mistaken for 'nothing to re-run'.
+
+        The ticket stays working with no comment, no counter increment, and
+        no transition; the next tick retries.
+        """
+        self._add_working(orchestrator)
+        with (
+            mock.patch.object(
+                linear, "list_comments_since", side_effect=LinearError("api down")
+            ),
+            mock.patch.object(orchestrator, "_resume_pipeline") as m_resume,
+            mock.patch.object(orchestrator, "_new_ticket_pipeline") as m_new,
+        ):
+            orchestrator._rerun_interrupted_turn(
+                orchestrator._state.get("ticket-1"), _make_issue()
+            )
+        ts = orchestrator._state.get("ticket-1")
+        assert ts is not None
+        assert ts.status == TicketStatus.working
+        assert ts.interrupted_turns == 0
+        assert ts.last_seen_comment_id == "cmt-seen-1"
+        assert "post_comment" not in linear.calls
+        assert "transition_to_state" not in linear.calls
+        m_resume.assert_not_called()
+        m_new.assert_not_called()
+
+    def test_initial_rerun_without_session(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """status=working + no session → counter++, initial pipeline re-run."""
+        self._add_working(orchestrator, session_id=None)
+        issue = _make_issue()
+        pending_comment = _make_comment("cmt-new", "please continue")
+        linear.set_response("list_comments_since", [pending_comment])
+        with mock.patch.object(orchestrator, "_new_ticket_pipeline") as m_new:
+            orchestrator._rerun_interrupted_turn(
+                orchestrator._state.get("ticket-1"), issue
+            )
+        ts = orchestrator._state.get("ticket-1")
+        assert ts is not None
+        assert ts.interrupted_turns == 1
+        pending = _format_comments_message([pending_comment])
+        m_new.assert_called_once_with(issue, pending, recovering=True)
+        posted = [b for _, b in linear.calls.get("post_comment", [])]
+        assert any("starting it again" in b and "attempt 1 of 3" in b for b in posted)
+        assert not any("Reply to continue" in b for b in posted)
+
+    def test_nothing_to_replay_parks(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """status=working + session + nothing pending → parked, counter not touched."""
+        self._add_working(orchestrator)
+        linear.set_response("list_comments_since", [])  # nothing new
+        with (
+            mock.patch.object(orchestrator, "_resume_pipeline") as m_resume,
+            mock.patch.object(orchestrator, "_new_ticket_pipeline") as m_new,
+        ):
+            orchestrator._rerun_interrupted_turn(
+                orchestrator._state.get("ticket-1"), _make_issue()
+            )
+        ts = orchestrator._state.get("ticket-1")
+        assert ts is not None
+        assert ts.status == TicketStatus.needs_input
+        assert ts.interrupted_turns == 0
+        m_resume.assert_not_called()
+        m_new.assert_not_called()
+        posted = [b for _, b in linear.calls.get("post_comment", [])]
+        assert any(
+            "Daemon restarted while I was working on this, but I have "
+            "nothing to re-run" in b
+            for b in posted
+        )
+        assert any("Reply to continue" in b for b in posted)
+        assert ("ticket-1", "Needs Input") in linear.calls.get(
+            "transition_to_state", []
+        )
+        # last_seen advanced to the parked comment so nothing replays.
+        assert ts.last_seen_comment_id == "cmt-ticket-1-2"
+
+    def test_give_up_at_max_interruptions(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """counter at the cap → give-up comment, parked, counter deliberately kept."""
+        self._add_working(orchestrator, interrupted_turns=3)
+        linear.set_response(
+            "list_comments_since",
+            [_make_comment("cmt-new", "please continue")],
+        )
+        with (
+            mock.patch.object(orchestrator, "_resume_pipeline") as m_resume,
+            mock.patch.object(orchestrator, "_new_ticket_pipeline") as m_new,
+        ):
+            orchestrator._rerun_interrupted_turn(
+                orchestrator._state.get("ticket-1"), _make_issue()
+            )
+        ts = orchestrator._state.get("ticket-1")
+        assert ts is not None
+        assert ts.status == TicketStatus.needs_input
+        assert ts.interrupted_turns == 3  # not reset on purpose
+        m_resume.assert_not_called()
+        m_new.assert_not_called()
+        posted = [b for _, b in linear.calls.get("post_comment", [])]
+        assert any("I re-ran the last turn 3 times" in b for b in posted)
+        assert any("Reply to continue" in b for b in posted)
+        assert ("ticket-1", "Needs Input") in linear.calls.get(
+            "transition_to_state", []
+        )
+        assert ts.last_seen_comment_id == "cmt-ticket-1-2"
+
+    def test_give_up_advances_last_seen_when_comment_post_fails(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """Give-up with a failed comment post still advances last_seen via baseline.
+
+        Otherwise the triggering comment replays on the next tick, the replay
+        is a non-recovery turn, and it resets the interruption counter —
+        defeating the cap.
+        """
+        self._add_working(orchestrator, interrupted_turns=3)
+        linear.set_response("post_comment", LinearError("api down"))
+        linear.set_response(
+            "list_comments_since",
+            [_make_comment("cmt-latest", "newest")],
+        )
+        with (
+            mock.patch.object(orchestrator, "_resume_pipeline") as m_resume,
+            mock.patch.object(orchestrator, "_new_ticket_pipeline") as m_new,
+        ):
+            orchestrator._rerun_interrupted_turn(
+                orchestrator._state.get("ticket-1"), _make_issue()
+            )
+        ts = orchestrator._state.get("ticket-1")
+        assert ts is not None
+        assert ts.status == TicketStatus.needs_input
+        assert ts.interrupted_turns == 3
+        # Comment post failed, so the baseline (newest comment) was used.
+        assert ts.last_seen_comment_id == "cmt-latest"
+        assert ("ticket-1", "Needs Input") in linear.calls.get(
+            "transition_to_state", []
+        )
+        m_resume.assert_not_called()
+        m_new.assert_not_called()
+
+    def test_interruption_streak_increments_to_cap(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """Repeated deaths increment the counter up to the cap, then give up."""
+        self._add_working(orchestrator)
+        linear.set_response(
+            "list_comments_since",
+            [_make_comment("cmt-new", "please continue")],
+        )
+        with mock.patch.object(orchestrator, "_resume_pipeline"):
+            for _ in range(3):
+                orchestrator._rerun_interrupted_turn(
+                    orchestrator._state.get("ticket-1"), _make_issue()
+                )
+        ts = orchestrator._state.get("ticket-1")
+        assert ts is not None
+        assert ts.interrupted_turns == 3
+        assert ts.status == TicketStatus.working  # still mid-turn
+        # The next interruption gives up.
+        orchestrator._rerun_interrupted_turn(
+            orchestrator._state.get("ticket-1"), _make_issue()
+        )
+        ts = orchestrator._state.get("ticket-1")
+        assert ts is not None
+        assert ts.status == TicketStatus.needs_input
+        assert ts.interrupted_turns == 3
+
+    def test_non_recovery_resume_resets_counter(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """A resume started by a genuine human comment resets the streak to 0."""
+        self._add_working(
+            orchestrator,
+            status=TicketStatus.needs_input,
+            interrupted_turns=2,
+        )
+        linear.set_response("list_comments_since", [_make_comment("c1", "Go")])
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config",
+                return_value=ProjectConfig(),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.run_resume", return_value=("Done!", None)
+            ),
+        ):
+            orchestrator._resume_pipeline(orchestrator._state.get("ticket-1"))
+        updated = orchestrator._state.get("ticket-1")
+        assert updated is not None
+        assert updated.status == TicketStatus.needs_input
+        assert updated.interrupted_turns == 0
+
+    def test_new_ticket_recovery_carries_counter(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """A recovery re-run of the initial pipeline keeps the streak across the fresh state."""
+        self._add_working(orchestrator, session_id=None, interrupted_turns=1)
+        linear.set_response(
+            "get_project",
+            Project(
+                id="proj-1",
+                name="Test",
+                links=[
+                    ProjectLink(label="Repo", url="https://github.com/org/repo.git")
+                ],
+            ),
+        )
+        linear.set_response("get_issue", _make_issue(description="Fix"))
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.clone_workspace",
+                return_value=("/tmp/ws/TEAM-1", False),
+            ),
+            mock.patch("symphony_linear.orchestrator.finalize_workspace"),
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config",
+                return_value=ProjectConfig(),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.run_initial",
+                return_value=("ses-x", "out", None),
+            ),
+        ):
+            orchestrator._new_ticket_pipeline(_make_issue(), recovering=True)
+        ts = orchestrator._state.get("ticket-1")
+        assert ts is not None
+        assert ts.status == TicketStatus.needs_input
+        assert ts.interrupted_turns == 1
+
+    def test_new_ticket_from_new_input_resets_counter(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """A fresh (non-recovery) initial turn starts the streak at 0."""
+        self._add_working(orchestrator, session_id=None, interrupted_turns=2)
+        linear.set_response(
+            "get_project",
+            Project(
+                id="proj-1",
+                name="Test",
+                links=[
+                    ProjectLink(label="Repo", url="https://github.com/org/repo.git")
+                ],
+            ),
+        )
+        linear.set_response("get_issue", _make_issue(description="Fix"))
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.clone_workspace",
+                return_value=("/tmp/ws/TEAM-1", False),
+            ),
+            mock.patch("symphony_linear.orchestrator.finalize_workspace"),
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config",
+                return_value=ProjectConfig(),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.run_initial",
+                return_value=("ses-x", "out", None),
+            ),
+        ):
+            orchestrator._new_ticket_pipeline(_make_issue())
+        ts = orchestrator._state.get("ticket-1")
+        assert ts is not None
+        assert ts.status == TicketStatus.needs_input
+        assert ts.interrupted_turns == 0
+
+    # --- Step-4 gates ---
+
+    def test_working_not_triggered_not_scheduled(
+        self,
+        tmp_path: Path,
+        state_mgr: StateManager,
+        linear: FakeLinearClient,
+    ) -> None:
+        """status=working + not in the trigger list → recovery NOT scheduled."""
+        config = _make_config(tmp_path)
+        orch = Orchestrator(
+            config=config,
+            state=state_mgr,
+            tracker=LinearTracker(linear=linear, config=config.linear),
+            workspace=tmp_path / "ws",
+        )  # type: ignore[arg-type]
+
+        ts = TicketState(
+            ticket_id="ticket-1",
+            ticket_identifier="TEAM-1",
+            repo_url="https://x",
+            workspace_path="/tmp/ws/TEAM-1",
+            branch="main",
+            status=TicketStatus.working,
+            session_id="ses-abc",
+        )
+        orch._state.upsert(ts)
+
+        # Missing from the poll list, but still triggered per get_issue, so
+        # step-3 cleanup leaves the entry alone.
+        linear.set_response("list_triggered_issues", [])
+        linear.set_response(
+            "get_issue", _make_issue(state="In Progress", labels=["Agent"])
+        )
+
+        with mock.patch.object(orch, "_rerun_interrupted_turn") as m_rerun:
+            orch._tick()
+            time.sleep(0.2)
+
+        m_rerun.assert_not_called()
+        assert orch._state.get("ticket-1") is not None
+
+    def test_working_cleanup_refused_not_scheduled(
+        self,
+        tmp_path: Path,
+        state_mgr: StateManager,
+        linear: FakeLinearClient,
+    ) -> None:
+        """status=working + cleanup_refused_state set → recovery NOT scheduled."""
+        config = _make_config(tmp_path)
+        orch = Orchestrator(
+            config=config,
+            state=state_mgr,
+            tracker=LinearTracker(linear=linear, config=config.linear),
+            workspace=tmp_path / "ws",
+        )  # type: ignore[arg-type]
+
+        ts = TicketState(
+            ticket_id="ticket-1",
+            ticket_identifier="TEAM-1",
+            repo_url="https://x",
+            workspace_path="/tmp/ws/TEAM-1",
+            branch="main",
+            status=TicketStatus.working,
+            session_id="ses-abc",
+            cleanup_refused_state="Needs Input",
+        )
+        orch._state.upsert(ts)
+
+        linear.set_response("list_triggered_issues", [_make_issue()])
+
+        with mock.patch.object(orch, "_rerun_interrupted_turn") as m_rerun:
+            orch._tick()
+            time.sleep(0.2)
+
+        m_rerun.assert_not_called()
+
+    def test_working_triggered_schedules_rerun(
+        self,
+        tmp_path: Path,
+        state_mgr: StateManager,
+        linear: FakeLinearClient,
+    ) -> None:
+        """status=working + triggered + no refusal → recovery scheduled with the issue."""
+        config = _make_config(tmp_path)
+        orch = Orchestrator(
+            config=config,
+            state=state_mgr,
+            tracker=LinearTracker(linear=linear, config=config.linear),
+            workspace=tmp_path / "ws",
+        )  # type: ignore[arg-type]
+
+        ts = TicketState(
+            ticket_id="ticket-1",
+            ticket_identifier="TEAM-1",
+            repo_url="https://x",
+            workspace_path="/tmp/ws/TEAM-1",
+            branch="main",
+            status=TicketStatus.working,
+            session_id="ses-abc",
+        )
+        orch._state.upsert(ts)
+
+        issue = _make_issue()
+        linear.set_response("list_triggered_issues", [issue])
+
+        with mock.patch.object(orch, "_rerun_interrupted_turn") as m_rerun:
+            orch._tick()
+            time.sleep(0.2)
+
+        m_rerun.assert_called_once()
+        assert m_rerun.call_args.args[1].id == "ticket-1"
 
 
 # ---------------------------------------------------------------------------

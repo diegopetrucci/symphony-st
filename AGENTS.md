@@ -138,9 +138,29 @@ shutting down, or the ticket is no longer triggered — see `_is_still_triggered
   the parent's NDJSON stdout is silent while a subagent task runs, so without
   the flag stdout alone is no liveness signal. Do not filter out the hourly
   `cleanup prune` log line; it resets the watchdog, and that is accepted.
+- **Restart recovery re-runs the interrupted turn, capped.** When the daemon
+  restarts (or a pipeline thread dies) mid-turn, the ticket stays in
+  `TicketStatus.working` and tick step 4 calls `_rerun_interrupted_turn`,
+  which re-runs the interrupted turn instead of bouncing the ticket to Needs
+  Input: with a session id and pending human comments it resumes the session;
+  without a session id it restarts the initial pipeline (carrying any pending
+  comments into the prompt); with a session id but nothing pending it parks
+  the ticket in `needs_input` with a "reply to continue" comment. Each re-run
+  increments `TicketState.interrupted_turns` (persisted before the re-run
+  starts), and after `_MAX_INTERRUPTED_TURNS` (3) consecutive interruptions
+  the daemon posts a give-up comment, advances `last_seen_comment_id`
+  best-effort, and parks the ticket in Needs Input without resetting the
+  counter. The give-up advance moves `last_seen_comment_id` past the
+  triggering comment, so that comment is deliberately not replayed — the
+  human must reply again. The counter is reset to 0 only when a turn starts
+  from genuinely new input (the pipelines do this alongside
+  `status = working`), and recovery only fires for tickets that are still in
+  the tick's trigger list and not cleanup-refused, so QA tickets,
+  untriggered tickets, and dirty-workspace refusals are left alone.
 - **No auto-retry on failure.** A failed ticket goes to `TicketStatus.failed`
   and only retries if the user comments (resume path) or if there's no
-  session id yet (re-runs the initial pipeline).
+  session id yet (re-runs the initial pipeline). Interrupted turns are the
+  exception: they are re-run by the restart-recovery invariant above.
 - **Setup errors are sticky.** `setup_error` is set when project/repo-link/
   workspace prep fails, and is cleared only when the user comments on the
   ticket. Don't clear it elsewhere.

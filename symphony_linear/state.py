@@ -80,6 +80,12 @@ class TicketState(BaseModel):
         "is dirty; the workflow state the ticket was in immediately after our "
         "refusal. Cleared (set to None) when the agent next takes a turn",
     )
+    interrupted_turns: int = Field(
+        0,
+        description="Consecutive interruptions of the current turn (daemon restart "
+        "or pipeline-thread death). Reset to 0 when a turn starts from "
+        "genuinely new input; left alone (or incremented) by recovery re-runs",
+    )
     attachment_count: int = Field(
         0, description="Number of attachment files written so far for this ticket"
     )
