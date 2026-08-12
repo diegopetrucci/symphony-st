@@ -5,6 +5,11 @@ version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
+    # Pinned explicitly rather than left to Dependabot's auto-detection, so the
+    # commits stay Conventional Commits-compliant for Release Please.
+    commit-message:
+      prefix: chore
+      include: scope
     groups:
       github-actions:
         patterns:
