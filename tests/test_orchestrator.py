@@ -1452,6 +1452,226 @@ class TestNewTicketRehydrate:
         assert len(restore_comments) == 1
         assert "*Symphony · workspace*" in restore_comments[0]
 
+    def test_rehydrate_with_pending_comment_posts_resuming_message_and_skips_transition(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """A pending human comment skips the needs_input transition; the next
+        tick's _resume_pipeline picks up the pending comment (state stays
+        needs_input, so step 4 schedules it)."""
+        from symphony_linear.state import SessionRecord
+
+        orchestrator._state.set_session(
+            "ticket-1",
+            SessionRecord(
+                session_id="ses-rehydrated", last_seen_comment_id="cmt-prior"
+            ),
+        )
+        # A human commented while the ticket was untriggered.
+        linear.set_response(
+            "list_comments_since", [_make_comment("cmt-new", "Please continue")]
+        )
+
+        linear.set_response(
+            "get_project",
+            Project(
+                id="proj-1",
+                name="Test",
+                links=[
+                    ProjectLink(label="Repo", url="https://github.com/org/repo.git")
+                ],
+            ),
+        )
+        linear.set_response("get_issue", _make_issue(description="Fix"))
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.clone_workspace",
+                return_value=("/tmp/ws/TEAM-1", False),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.finalize_workspace",
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config",
+                return_value=ProjectConfig(),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.run_initial",
+            ) as mock_run_initial,
+        ):
+            orchestrator._new_ticket_pipeline(_make_issue())
+
+        mock_run_initial.assert_not_called()
+
+        # State stays needs_input with the rehydrated session so the next tick
+        # schedules _resume_pipeline.
+        ts = orchestrator._state.get("ticket-1")
+        assert ts is not None
+        assert ts.status == TicketStatus.needs_input
+        assert ts.session_id == "ses-rehydrated"
+        assert ts.last_seen_comment_id == "cmt-prior"
+
+        # Tracker must NOT be transitioned back to Needs Input (the resume
+        # pipeline transitions it to In Progress itself).
+        transition_calls = linear.calls.get("transition_to_state", [])
+        assert not any(
+            tid == "ticket-1" and state == "Needs Input"
+            for tid, state in transition_calls
+        )
+
+        # The "resuming" message was posted, the "next comment" message was not.
+        post_calls = linear.calls.get("post_comment", [])
+        assert any(
+            "Workspace restored — resuming previous session with your comment." in body
+            for _, body in post_calls
+        )
+        assert not any(
+            "previous session will resume on your next comment" in body
+            for _, body in post_calls
+        )
+
+    def test_rehydrate_without_pending_comment_keeps_current_behavior(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """Without pending human comments, rehydrate behaves exactly as before."""
+        from symphony_linear.state import SessionRecord
+
+        orchestrator._state.set_session(
+            "ticket-1",
+            SessionRecord(
+                session_id="ses-rehydrated", last_seen_comment_id="cmt-prior"
+            ),
+        )
+        # No comments since last_seen (default response is []).
+
+        linear.set_response(
+            "get_project",
+            Project(
+                id="proj-1",
+                name="Test",
+                links=[
+                    ProjectLink(label="Repo", url="https://github.com/org/repo.git")
+                ],
+            ),
+        )
+        linear.set_response("get_issue", _make_issue(description="Fix"))
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.clone_workspace",
+                return_value=("/tmp/ws/TEAM-1", False),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.finalize_workspace",
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config",
+                return_value=ProjectConfig(),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.run_initial",
+            ) as mock_run_initial,
+        ):
+            orchestrator._new_ticket_pipeline(_make_issue())
+
+        mock_run_initial.assert_not_called()
+
+        ts = orchestrator._state.get("ticket-1")
+        assert ts is not None
+        assert ts.status == TicketStatus.needs_input
+        assert ts.session_id == "ses-rehydrated"
+
+        # Tracker IS transitioned to Needs Input.
+        transition_calls = linear.calls.get("transition_to_state", [])
+        assert any(
+            tid == "ticket-1" and state == "Needs Input"
+            for tid, state in transition_calls
+        )
+
+        # The "next comment" message was posted, the "resuming" message was not.
+        post_calls = linear.calls.get("post_comment", [])
+        assert any(
+            "Workspace restored — previous session will resume on your next comment."
+            in body
+            for _, body in post_calls
+        )
+        assert not any(
+            "resuming previous session with your comment" in body
+            for _, body in post_calls
+        )
+
+    def test_rehydrate_pending_check_error_keeps_current_behavior(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """A tracker failure during the pending-comment check falls back to the
+        current needs_input behavior."""
+        from symphony_linear.state import SessionRecord
+
+        orchestrator._state.set_session(
+            "ticket-1",
+            SessionRecord(
+                session_id="ses-rehydrated", last_seen_comment_id="cmt-prior"
+            ),
+        )
+
+        linear.set_response(
+            "get_project",
+            Project(
+                id="proj-1",
+                name="Test",
+                links=[
+                    ProjectLink(label="Repo", url="https://github.com/org/repo.git")
+                ],
+            ),
+        )
+        linear.set_response("get_issue", _make_issue(description="Fix"))
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.clone_workspace",
+                return_value=("/tmp/ws/TEAM-1", False),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.finalize_workspace",
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config",
+                return_value=ProjectConfig(),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.run_initial",
+            ) as mock_run_initial,
+            mock.patch.object(
+                orchestrator._tracker,
+                "list_comments_since",
+                side_effect=LinearError("boom"),
+            ),
+        ):
+            orchestrator._new_ticket_pipeline(_make_issue())
+
+        mock_run_initial.assert_not_called()
+
+        ts = orchestrator._state.get("ticket-1")
+        assert ts is not None
+        assert ts.status == TicketStatus.needs_input
+        assert ts.session_id == "ses-rehydrated"
+
+        # Tracker IS transitioned to Needs Input (fallback path).
+        transition_calls = linear.calls.get("transition_to_state", [])
+        assert any(
+            tid == "ticket-1" and state == "Needs Input"
+            for tid, state in transition_calls
+        )
+
+        # The "next comment" message was posted, the "resuming" message was not.
+        post_calls = linear.calls.get("post_comment", [])
+        assert any(
+            "Workspace restored — previous session will resume on your next comment."
+            in body
+            for _, body in post_calls
+        )
+        assert not any(
+            "resuming previous session with your comment" in body
+            for _, body in post_calls
+        )
+
 
 # ---------------------------------------------------------------------------
 # Resume pipeline

@@ -1344,6 +1344,24 @@ class Orchestrator:
                 self._state.upsert(ticket_state)
                 self._state.save()
 
+            # If the human already commented while the ticket was untriggered,
+            # don't bounce the tracker back to needs_input: the next tick's
+            # _resume_pipeline picks up the pending comment (state stays
+            # needs_input, so step 4 schedules it) and transitions the tracker
+            # to in_progress itself.  _pending_human_comments swallows tracker
+            # failures, so an error falls through to the needs_input path below.
+            if (
+                self._pending_human_comments(tid, session_record.last_seen_comment_id)
+                is not None
+            ):
+                self._post_comment_safe(
+                    tid,
+                    "Workspace restored — resuming previous session with your comment.",
+                    kind="workspace",
+                )
+                logger.info("New ticket pipeline rehydrated for %s", tid)
+                return
+
             # Transition the tracker to needs_input.
             try:
                 self._tracker.transition_to(tid, TransitionTarget.needs_input)
