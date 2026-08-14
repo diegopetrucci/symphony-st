@@ -1160,6 +1160,7 @@ class Orchestrator:
             repo_url = self._tracker.repo_url_for(issue)
         except TrackerError as exc:
             logger.warning("Ticket %s has no resolvable repo: %s", tid, exc)
+            self._transition_failed_to_needs_input(tid)
             err_comment = self._post_comment_safe(
                 tid,
                 f"**Symphony error**: {exc}",
@@ -1213,6 +1214,7 @@ class Orchestrator:
             )
         except (WorkspaceError, FileNotFoundError) as exc:
             logger.error("Workspace clone failed for %s: %s", tid, exc)
+            self._transition_failed_to_needs_input(tid)
             err_comment = self._post_comment_safe(
                 tid,
                 f"**Symphony error**: Workspace clone failed:\n```\n{exc}\n```",
@@ -1243,6 +1245,7 @@ class Orchestrator:
             project_config = load_project_config(workspace_path)
         except ProjectConfigError as exc:
             logger.error("Project config invalid for %s: %s", tid, exc)
+            self._transition_failed_to_needs_input(tid)
             err_comment = self._post_comment_safe(
                 tid,
                 f"**Symphony error**: Invalid project config:\n```\n{exc}\n```",
@@ -1288,6 +1291,7 @@ class Orchestrator:
             )
         except (WorkspaceError, FileNotFoundError) as exc:
             logger.error("Workspace finalization failed for %s: %s", tid, exc)
+            self._transition_failed_to_needs_input(tid)
             err_comment = self._post_comment_safe(
                 tid,
                 f"**Symphony error**: Workspace preparation failed:\n```\n{exc}\n```",
@@ -1483,6 +1487,7 @@ class Orchestrator:
                     f"\n\nPartial output before the timeout:\n\n---\n\n"
                     f"{exc.partial_message}"
                 )
+            self._transition_failed_to_needs_input(tid)
             err_comment = self._post_comment_safe(
                 tid,
                 body,
@@ -1502,6 +1507,7 @@ class Orchestrator:
             return
         except OpenCodeError as exc:
             logger.error("OpenCode failed for %s: %s", tid, exc)
+            self._transition_failed_to_needs_input(tid)
             err_comment = self._post_comment_safe(
                 tid,
                 f"**Symphony error**: The AI turn failed:\n```\n{exc}\n```",
@@ -1681,6 +1687,7 @@ class Orchestrator:
             project_config = load_project_config(ticket_state.workspace_path)
         except ProjectConfigError as exc:
             logger.error("Project config invalid for %s on resume: %s", tid, exc)
+            self._transition_failed_to_needs_input(tid)
             err_comment = self._post_comment_safe(
                 tid,
                 f"**Symphony error**: Invalid project config:\n```\n{exc}\n```",
@@ -1754,6 +1761,7 @@ class Orchestrator:
                     f"\n\nPartial output before the timeout:\n\n---\n\n"
                     f"{exc.partial_message}"
                 )
+            self._transition_failed_to_needs_input(tid)
             err_comment = self._post_comment_safe(
                 tid,
                 body,
@@ -1772,6 +1780,7 @@ class Orchestrator:
             return
         except OpenCodeError as exc:
             logger.error("OpenCode resume failed for %s: %s", tid, exc)
+            self._transition_failed_to_needs_input(tid)
             err_comment = self._post_comment_safe(
                 tid,
                 f"**Symphony error**: The AI turn failed:\n```\n{exc}\n```",
@@ -1829,6 +1838,33 @@ class Orchestrator:
     # ==================================================================
     # Shared helpers
     # ==================================================================
+
+    def _transition_failed_to_needs_input(self, tid: str) -> None:
+        """Best-effort: move a failed ticket to the tracker's Needs Input state.
+
+        Called on every failure path right before the error comment is posted,
+        so a failed ticket never sits in the tracker's In Progress state with
+        no work in flight.  The internal ``TicketStatus.failed`` is unchanged
+        and keeps driving the retry routes; only the tracker state moves.
+
+        Skipped when the ticket is cancelled: a human may have moved it to QA
+        mid-turn, and a failure path must not drag it back.  Never raises.
+        """
+        if self._is_cancelled(tid):
+            logger.info(
+                "Ticket %s cancelled — skipping failure transition to '%s'",
+                tid,
+                TransitionTarget.needs_input.value,
+            )
+            return
+        try:
+            self._tracker.transition_to(tid, TransitionTarget.needs_input)
+        except Exception:
+            logger.exception(
+                "Failed to transition %s to '%s'",
+                tid,
+                TransitionTarget.needs_input.value,
+            )
 
     def _post_comment_safe(
         self, tid: str, body: str, *, return_comment: bool = False, kind: str = "error"

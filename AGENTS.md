@@ -159,8 +159,15 @@ shutting down, or the ticket is no longer triggered — see `_is_still_triggered
   untriggered tickets, and dirty-workspace refusals are left alone.
 - **No auto-retry on failure.** A failed ticket goes to `TicketStatus.failed`
   and only retries if the user comments (resume path) or if there's no
-  session id yet (re-runs the initial pipeline). Interrupted turns are the
-  exception: they are re-run by the restart-recovery invariant above.
+  session id yet (re-runs the initial pipeline). The internal status and the
+  tracker state are deliberately decoupled: every failure path that ends in
+  `TicketStatus.failed` with a tracker comment also transitions the tracker
+  ticket to its Needs Input state — before posting the error comment (a
+  comment without a state change self-amplifies through the webhook) and only
+  when the ticket is not cancelled (a human may have moved it to QA
+  mid-turn) — via `_transition_failed_to_needs_input`. The internal status
+  stays `failed` so the retry routes above keep working. Interrupted turns
+  are the exception: they are re-run by the restart-recovery invariant above.
 - **Setup errors are sticky.** `setup_error` is set when project/repo-link/
   workspace prep fails, and is cleared only when the user comments on the
   ticket. Don't clear it elsewhere.

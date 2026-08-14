@@ -604,6 +604,175 @@ class TestNewTicketPipeline:
         assert ts.last_seen_comment_id is not None
         assert ts.session_id is None
 
+    def test_turn_failure_transitions_to_needs_input_before_error_comment(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """A timed-out turn parks the tracker ticket in Needs Input before commenting."""
+        linear.set_response(
+            "get_project",
+            Project(
+                id="proj-1",
+                name="Test",
+                links=[
+                    ProjectLink(label="Repo", url="https://github.com/org/repo.git")
+                ],
+            ),
+        )
+        linear.set_response("get_issue", _make_issue(description="Fix"))
+
+        events: list[str] = []
+        orig_transition = linear.transition_to_state
+        orig_comment = linear.post_comment
+
+        def record_transition(iid: str, state: str) -> None:
+            events.append(f"transition:{state}")
+            orig_transition(iid, state)
+
+        def record_comment(iid: str, body: str) -> Comment:
+            events.append(f"comment:{body}")
+            return orig_comment(iid, body)
+
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.clone_workspace",
+                return_value=("/tmp/ws/TEAM-1", False),
+            ),
+            mock.patch("symphony_linear.orchestrator.finalize_workspace"),
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config",
+                return_value=ProjectConfig(),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.run_initial",
+                side_effect=OpenCodeTimeout("t", reason="exceeded 30s in total"),
+            ),
+            mock.patch.object(
+                linear, "transition_to_state", side_effect=record_transition
+            ),
+            mock.patch.object(linear, "post_comment", side_effect=record_comment),
+        ):
+            orchestrator._new_ticket_pipeline(_make_issue())
+
+        assert ("ticket-1", "Needs Input") in linear.calls.get(
+            "transition_to_state", []
+        )
+        # The transition must precede the error comment (a comment without a
+        # state change self-amplifies through the webhook).
+        needs_input_idx = events.index("transition:Needs Input")
+        error_idx = next(i for i, e in enumerate(events) if "timed out" in e)
+        assert needs_input_idx < error_idx
+
+        ts = orchestrator._state.get("ticket-1")
+        assert ts is not None
+        assert ts.status == TicketStatus.failed
+
+    def test_setup_error_transitions_to_needs_input_before_comment(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """Clone failure parks the tracker ticket in Needs Input before the error comment."""
+        from symphony_linear.workspace import CloneFailed
+
+        linear.set_response(
+            "get_project",
+            Project(
+                id="proj-1",
+                name="Test",
+                links=[
+                    ProjectLink(label="Repo", url="https://github.com/org/repo.git")
+                ],
+            ),
+        )
+
+        events: list[str] = []
+        orig_transition = linear.transition_to_state
+        orig_comment = linear.post_comment
+
+        def record_transition(iid: str, state: str) -> None:
+            events.append(f"transition:{state}")
+            orig_transition(iid, state)
+
+        def record_comment(iid: str, body: str) -> Comment:
+            events.append(f"comment:{body}")
+            return orig_comment(iid, body)
+
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.clone_workspace",
+                side_effect=CloneFailed("fail"),
+            ),
+            mock.patch.object(
+                linear, "transition_to_state", side_effect=record_transition
+            ),
+            mock.patch.object(linear, "post_comment", side_effect=record_comment),
+        ):
+            orchestrator._new_ticket_pipeline(_make_issue())
+
+        assert ("ticket-1", "Needs Input") in linear.calls.get(
+            "transition_to_state", []
+        )
+        needs_input_idx = events.index("transition:Needs Input")
+        error_idx = next(i for i, e in enumerate(events) if "clone failed" in e)
+        assert needs_input_idx < error_idx
+
+        ts = orchestrator._state.get("ticket-1")
+        assert ts is not None
+        assert ts.status == TicketStatus.failed
+        assert ts.setup_error is not None
+
+    def test_failure_transition_skipped_when_cancelled(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """A cancelled ticket's failure path skips the Needs Input transition.
+
+        A human may have moved the ticket to QA mid-turn; the failure handler
+        must not drag it back.  The error comment and internal failed state
+        still happen.
+        """
+        linear.set_response(
+            "get_project",
+            Project(
+                id="proj-1",
+                name="Test",
+                links=[
+                    ProjectLink(label="Repo", url="https://github.com/org/repo.git")
+                ],
+            ),
+        )
+        linear.set_response("get_issue", _make_issue(description="Fix"))
+
+        def cancel_then_timeout(*a: Any, **kw: Any) -> tuple[str, str, int | None]:
+            orchestrator._cancel_ticket("ticket-1")
+            raise OpenCodeTimeout("t", reason="exceeded 30s in total")
+
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.clone_workspace",
+                return_value=("/tmp/ws/TEAM-1", False),
+            ),
+            mock.patch("symphony_linear.orchestrator.finalize_workspace"),
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config",
+                return_value=ProjectConfig(),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.run_initial",
+                side_effect=cancel_then_timeout,
+            ),
+        ):
+            orchestrator._new_ticket_pipeline(_make_issue())
+
+        # The early in-progress transition may have run; the failure
+        # transition to Needs Input must be skipped.
+        transitions = linear.calls.get("transition_to_state", [])
+        assert ("ticket-1", "Needs Input") not in transitions
+
+        # The error comment is still posted, and the internal state stays failed.
+        post_calls = linear.calls.get("post_comment", [])
+        assert any("timed out" in body for _, body in post_calls)
+        ts = orchestrator._state.get("ticket-1")
+        assert ts is not None
+        assert ts.status == TicketStatus.failed
+
     def test_failed_transition_saves_failed(
         self, orchestrator: Orchestrator, linear: FakeLinearClient
     ) -> None:
@@ -1786,6 +1955,53 @@ class TestResumePipeline:
         assert updated is not None
         assert updated.last_seen_comment_id != "cmt-seen-1"
 
+    def test_resume_failure_transitions_to_needs_input_before_comment(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """A failed resume turn parks the tracker ticket in Needs Input before commenting."""
+        ts = self._make_ts()
+        orchestrator._state.upsert(ts)
+        linear.set_response("list_comments_since", [_make_comment("c1", "Go")])
+
+        events: list[str] = []
+        orig_transition = linear.transition_to_state
+        orig_comment = linear.post_comment
+
+        def record_transition(iid: str, state: str) -> None:
+            events.append(f"transition:{state}")
+            orig_transition(iid, state)
+
+        def record_comment(iid: str, body: str) -> Comment:
+            events.append(f"comment:{body}")
+            return orig_comment(iid, body)
+
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config",
+                return_value=ProjectConfig(),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.run_resume",
+                side_effect=OpenCodeError("boom"),
+            ),
+            mock.patch.object(
+                linear, "transition_to_state", side_effect=record_transition
+            ),
+            mock.patch.object(linear, "post_comment", side_effect=record_comment),
+        ):
+            orchestrator._resume_pipeline(ts)
+
+        assert ("ticket-1", "Needs Input") in linear.calls.get(
+            "transition_to_state", []
+        )
+        # The failure transition must precede the error comment.
+        needs_input_idx = events.index("transition:Needs Input")
+        error_idx = next(i for i, e in enumerate(events) if "failed" in e)
+        assert needs_input_idx < error_idx
+        updated = orchestrator._state.get("ticket-1")
+        assert updated is not None
+        assert updated.status == TicketStatus.failed
+
     def test_resume_timeout_comment_includes_partial_output(
         self, orchestrator: Orchestrator, linear: FakeLinearClient
     ) -> None:
@@ -2021,10 +2237,10 @@ class TestResumeProjectConfig:
         assert updated.setup_error == "project_config_invalid"
         assert updated.last_seen_comment_id is not None
 
-    def test_project_config_error_does_not_transition_linear(
+    def test_project_config_error_transitions_to_needs_input_not_in_progress(
         self, orchestrator: Orchestrator, linear: FakeLinearClient
     ) -> None:
-        """ProjectConfigError on resume must NOT transition Linear to in_progress_state."""
+        """ProjectConfigError on resume transitions to needs_input, never in_progress."""
         ts = self._make_ts()
         orchestrator._state.upsert(ts)
         linear.set_response("list_comments_since", [_make_comment("c1", "Go")])
@@ -2036,13 +2252,14 @@ class TestResumeProjectConfig:
         ):
             orchestrator._resume_pipeline(ts)
 
-        # Linear transition_to_state must NOT have been called for this ticket.
         transition_calls = linear.calls.get("transition_to_state", [])
-        in_progress_transitions = [
+        ticket_transitions = [
             (tid, state) for tid, state in transition_calls if tid == "ticket-1"
         ]
-        assert in_progress_transitions == [], (
-            f"Expected no transition for ticket-1, got: {in_progress_transitions}"
+        # The failure path parks the ticket in Needs Input, and must not move
+        # it to In Progress (no turn ever started).
+        assert ticket_transitions == [("ticket-1", "Needs Input")], (
+            f"Expected only a needs_input transition for ticket-1, got: {ticket_transitions}"
         )
 
     def test_missing_project_config_falls_back_to_globals_on_resume(
