@@ -599,13 +599,13 @@ def _execute(
         # Decode outputs once.
         # ------------------------------------------------------------------
         stdout_text = b"".join(stdout_chunks).decode(errors="replace")
-        stderr_tail = b"".join(stderr_chunks).decode(errors="replace")
+        stderr_text = b"".join(stderr_chunks).decode(errors="replace")
 
         # Raw OpenCode output; only useful when diagnosing parse/protocol issues.
         logger.debug("=== raw OpenCode stdout ===\n%s\n=== end stdout ===", stdout_text)
-        if stderr_tail:
+        if stderr_text:
             logger.debug(
-                "=== raw OpenCode stderr ===\n%s\n=== end stderr ===", stderr_tail
+                "=== raw OpenCode stderr ===\n%s\n=== end stderr ===", stderr_text
             )
 
         # ------------------------------------------------------------------
@@ -630,14 +630,14 @@ def _execute(
 
         if exit_code != 0:
             raise OpenCodeError(
-                f"OpenCode exited with code {exit_code}\nstderr: {stderr_tail[:2000]}"
+                f"OpenCode exited with code {exit_code}\nstderr: {stderr_text[-2000:]}"
             )
 
         if session_id is None:
             raise OpenCodeError(
                 "No session ID found in OpenCode JSON stream.\n"
                 f"stdout: {stdout_text[:2000]}\n"
-                f"stderr: {stderr_tail[:2000]}"
+                f"stderr: {stderr_text[-2000:]}"
             )
 
         # ------------------------------------------------------------------

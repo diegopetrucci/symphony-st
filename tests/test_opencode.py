@@ -623,6 +623,45 @@ class TestExecuteTimeout:
         assert final_message == "fast done"
 
 
+class TestExecuteExitErrors:
+    """Verify the error paths through :func:`_execute` for exited processes."""
+
+    @staticmethod
+    def _run_initial(proc: "_FakePopen") -> OpenCodeError:
+        """Run run_initial against *proc* and return the raised error."""
+        with patch("symphony_linear.opencode.run_in_sandbox", return_value=proc):
+            with pytest.raises(OpenCodeError) as excinfo:
+                run_initial(
+                    workspace_path="/ws",
+                    tmp_path="/ws/tmp",
+                    prompt="do it",
+                    timeout_seconds=10,
+                    idle_timeout_seconds=10,
+                    on_subprocess=lambda p: None,
+                )
+        return excinfo.value
+
+    def test_nonzero_exit_reports_stderr_tail(self) -> None:
+        """A non-zero exit reports the *tail* of stderr, not the head.
+
+        The head of OpenCode's stderr is always bootstrap noise ("loading
+        path=..."); the real failure reason is at the end of the stream.
+        Regression: the error used to embed ``stderr[:2000]``, so long
+        startup logs pushed the actual error out of the comment entirely.
+        """
+        stderr_head = "loading path=/usr/bin/opencode\n" * 100
+        stderr_middle = "[log] working on task\n" * 200
+        stderr_tail = "AI_APICallError: Overloaded\n" * 3
+        proc = _FakePopen(
+            stderr=(stderr_head + stderr_middle + stderr_tail).encode(),
+            exit_code=1,
+        )
+        exc = self._run_initial(proc)
+        msg = str(exc)
+        assert "AI_APICallError: Overloaded" in msg
+        assert "loading path" not in msg
+
+
 class TestOpenCodeTimeoutAttributes:
     """Verify OpenCodeTimeout carries partial_message, session_id, and reason."""
 
