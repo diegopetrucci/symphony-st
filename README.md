@@ -402,8 +402,15 @@ WorkingDirectory=%h/symphony
 # value).
 Environment=LINEAR_API_KEY=lin_api_...
 # Environment=GITHUB_TOKEN=ghp_...
-# systemd strips PATH; tell the sandbox where to find opencode, git, bwrap.
-Environment=SYMPHONY_SANDBOX_PATH=/usr/local/bin:/usr/bin:/bin
+# systemd strips PATH; tell the sandbox where to find opencode, git, bwrap,
+# and anything your .symphony/setup script calls. Include %h/.local/bin if
+# your setup script uses tools installed there, such as uv or uvx.
+Environment=SYMPHONY_SANDBOX_PATH=%h/.local/bin:%h/.opencode/bin:/usr/local/bin:/usr/bin:/bin
+# Point at your SSH agent, or every clone of a private repo over SSH fails
+# with "Permission denied (publickey)". A systemd unit inherits nothing from
+# your shell. Use %t/gcr/ssh for gnome-keyring, %t/openssh_agent for a plain
+# ssh-agent. Drop this line if you clone over HTTPS with a token.
+Environment=SSH_AUTH_SOCK=%t/gcr/ssh
 ExecStart=%h/.local/bin/symphony-linear
 Restart=on-failure
 
@@ -412,6 +419,24 @@ WantedBy=default.target
 ```
 
 Then `systemctl --user daemon-reload && systemctl --user enable --now symphony`.
+
+Two variables in that sample cause most deployment failures, because both
+work by accident when you launch Symphony from a terminal and stop working
+under systemd:
+
+- `SYMPHONY_SANDBOX_PATH` is the `PATH` inside the sandbox. If it omits a
+  directory that `.symphony/setup` needs, the setup step exits with code 127
+  and a `command not found` message.
+- `SSH_AUTH_SOCK` is needed because Symphony clones project repos outside
+  the sandbox with your credentials.
+
+The daemon starts cleanly in both cases; the failure appears later, on the
+first ticket.
+
+By default the unit starts when you log in. To start it at boot instead,
+run `loginctl enable-linger $USER`. Note that a lingering service starts
+before you unlock your keyring, so an agent-based `SSH_AUTH_SOCK` is not
+ready yet at that point.
 
 ### Flags
 
