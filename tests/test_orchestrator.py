@@ -285,6 +285,52 @@ class TestNewTicketPipeline:
         assert kw.get("on_subprocess") is not None
         assert kw.get("auto_branch") is True  # global default
 
+    def test_model_label_reaches_run_initial_and_footer(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """A Model: label on the issue is resolved via the models alias map,
+        passed to run_initial, and named in the final-comment footer."""
+        orchestrator._config.models["strong"] = "anthropic/claude-opus-5"
+        linear.set_response(
+            "get_project",
+            Project(
+                id="proj-1",
+                name="Test",
+                links=[
+                    ProjectLink(label="Repo", url="https://github.com/org/repo.git")
+                ],
+            ),
+        )
+        linear.set_response("get_issue", _make_issue(description="Fix the bug"))
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.clone_workspace",
+                return_value=("/tmp/ws/TEAM-1", False),
+            ),
+            mock.patch("symphony_linear.orchestrator.finalize_workspace"),
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config",
+                return_value=ProjectConfig(),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.run_initial",
+                return_value=("ses-abc", "Done!", 37074),
+            ) as mock_run_initial,
+        ):
+            orchestrator._new_ticket_pipeline(
+                _make_issue(labels=["Agent", "Model: strong"])
+            )
+
+        assert mock_run_initial.call_args.kwargs["model"] == "anthropic/claude-opus-5"
+        post_calls = linear.calls.get("post_comment", [])
+        final_bodies = [body for tid, body in post_calls if "Done!" in body]
+        assert len(final_bodies) == 1
+        expected = (
+            "Done!\n\n*Symphony · context: 37,074 tokens · model: "
+            "anthropic/claude-opus-5*"
+        )
+        assert final_bodies[0] == expected
+
     def test_missing_repo_saves_setup_error(
         self, orchestrator: Orchestrator, linear: FakeLinearClient
     ) -> None:
@@ -2166,6 +2212,62 @@ class TestResumePipeline:
         assert len(final_bodies) == 1
         assert "*Symphony · context: 1,234,567 tokens*" in final_bodies[0]
 
+    # --- Per-issue model override (resume pipeline) ---
+
+    def test_model_passed_to_run_resume_and_footer(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """A resolved model is passed to run_resume and named in the footer."""
+        ts = self._make_ts()
+        orchestrator._state.upsert(ts)
+        linear.set_response("list_comments_since", [_make_comment("c1", "Fix please")])
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config",
+                return_value=ProjectConfig(),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.run_resume",
+                return_value=("Done!", 37074),
+            ) as mock_run_resume,
+        ):
+            orchestrator._resume_pipeline(ts, "anthropic/claude-opus-5")
+
+        assert mock_run_resume.call_args.kwargs["model"] == "anthropic/claude-opus-5"
+        post_calls = linear.calls.get("post_comment", [])
+        final_bodies = [body for tid, body in post_calls if "Done!" in body]
+        assert len(final_bodies) == 1
+        expected = (
+            "Done!\n\n*Symphony · context: 37,074 tokens · model: "
+            "anthropic/claude-opus-5*"
+        )
+        assert final_bodies[0] == expected
+
+    def test_no_model_footer_unchanged(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """Without a model, run_resume gets model=None and the footer is unchanged."""
+        ts = self._make_ts()
+        orchestrator._state.upsert(ts)
+        linear.set_response("list_comments_since", [_make_comment("c1", "Fix please")])
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config",
+                return_value=ProjectConfig(),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.run_resume",
+                return_value=("Done!", 37074),
+            ) as mock_run_resume,
+        ):
+            orchestrator._resume_pipeline(ts)
+
+        assert mock_run_resume.call_args.kwargs["model"] is None
+        post_calls = linear.calls.get("post_comment", [])
+        final_bodies = [body for tid, body in post_calls if "Done!" in body]
+        assert len(final_bodies) == 1
+        assert final_bodies[0] == "Done!\n\n*Symphony · context: 37,074 tokens*"
+
 
 # ---------------------------------------------------------------------------
 # Project config integration in resume pipeline
@@ -2883,6 +2985,31 @@ class TestTick:
         ts_passed = m_resume.call_args[0][0]
         assert ts_passed.session_id == "ses-abc"
 
+    def test_setup_error_retry_resume_passes_model(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """Step-2 setup-error retry with a session resolves the per-issue model
+        from the freshly fetched issue and passes it to _resume_pipeline."""
+        orchestrator._config.models["strong"] = "anthropic/claude-opus-5"
+        self._add_state(
+            orchestrator,
+            status=TicketStatus.failed,
+            setup_error="project_config_invalid",
+            session_id="ses-abc",
+            last_seen_comment_id="cmt-old",
+            workspace_path="/tmp/ws/TEAM-1",
+        )
+        linear.set_response(
+            "list_triggered_issues", [_make_issue(labels=["Agent", "Model: strong"])]
+        )
+        linear.set_response("list_comments_since", [_make_comment("c1", "fix config")])
+        with mock.patch.object(orchestrator, "_resume_pipeline") as m_resume:
+            orchestrator._tick()
+            time.sleep(0.2)
+        m_resume.assert_called_once()
+        model_passed = m_resume.call_args[0][1]
+        assert model_passed == "anthropic/claude-opus-5"
+
     def test_failed_no_session_retried_on_comment(
         self, orchestrator: Orchestrator, linear: FakeLinearClient
     ) -> None:
@@ -2938,6 +3065,23 @@ class TestTick:
             orchestrator._tick()
             time.sleep(0.2)
         m.assert_called_once()
+
+    def test_step4_resume_passes_model_from_issue(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """Step 4 schedules _resume_pipeline with the model resolved from the
+        freshly fetched issue's labels."""
+        orchestrator._config.models["strong"] = "anthropic/claude-opus-5"
+        self._add_state(orchestrator)
+        linear.set_response(
+            "list_triggered_issues", [_make_issue(labels=["Agent", "Model: strong"])]
+        )
+        with mock.patch.object(orchestrator, "_resume_pipeline") as m:
+            orchestrator._tick()
+            time.sleep(0.2)
+        m.assert_called_once()
+        model_passed = m.call_args[0][1]
+        assert model_passed == "anthropic/claude-opus-5"
 
     # --- Step-4 routing: no session id ⟹ initial turn, never resume ---
 
@@ -4082,7 +4226,12 @@ class TestRerunInterruptedTurn:
     def test_resume_rerun_mocked_pipeline(
         self, orchestrator: Orchestrator, linear: FakeLinearClient
     ) -> None:
-        """_resume_pipeline is invoked with the precomputed replay message."""
+        """_resume_pipeline is invoked with the precomputed replay message.
+
+        The per-issue model override is resolved from the issue's labels and
+        passed positionally; the default issue has no Model: label, so it is
+        None here.
+        """
         self._add_working(orchestrator)
         pending_comment = _make_comment("cmt-new", "please continue")
         linear.set_response("list_comments_since", [pending_comment])
@@ -4094,7 +4243,29 @@ class TestRerunInterruptedTurn:
         assert ts is not None
         assert ts.interrupted_turns == 1
         m_resume.assert_called_once_with(
-            ts, replay_message=_format_comments_message([pending_comment])
+            ts, None, replay_message=_format_comments_message([pending_comment])
+        )
+
+    def test_resume_rerun_resolves_model_from_labels(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """A Model: label on the fetched issue is resolved and passed to
+        _resume_pipeline on the recovery re-run."""
+        orchestrator._config.models["strong"] = "anthropic/claude-opus-5"
+        self._add_working(orchestrator)
+        linear.set_response(
+            "list_comments_since", [_make_comment("cmt-new", "please continue")]
+        )
+        with mock.patch.object(orchestrator, "_resume_pipeline") as m_resume:
+            orchestrator._rerun_interrupted_turn(
+                orchestrator._state.get("ticket-1"),
+                _make_issue(labels=["Agent", "Model: strong"]),
+            )
+        ts = orchestrator._state.get("ticket-1")
+        assert ts is not None
+        assert ts.interrupted_turns == 1
+        m_resume.assert_called_once_with(
+            ts, "anthropic/claude-opus-5", replay_message=mock.ANY
         )
 
     def test_recovery_fetch_failure_leaves_ticket_working(

@@ -230,6 +230,7 @@ def run_initial(
     attachments_path: str | None = None,
     tmp_path: str,
     files: list[str] | None = None,
+    model: str | None = None,
 ) -> tuple[str, str, int | None]:
     """Launch OpenCode for a new session with *prompt* and return the session
     id, final assistant message, and context-window token count.
@@ -260,6 +261,10 @@ def run_initial(
         files: File paths to attach to the turn via ``--file``.  Each path is
             emitted as a ``--file <path>`` pair before the ``--`` separator.
             Defaults to ``None`` (no files).
+        model: Optional per-issue model override for the primary agent.  When
+            set, ``--model <model>`` is passed on the command line and beats
+            the agent's configured model.  Defaults to ``None`` (agent
+            default applies).
 
     Returns:
         A tuple of ``(session_id, final_message, context_tokens)`` where
@@ -281,6 +286,8 @@ def run_initial(
         "--dangerously-skip-permissions",
         "--print-logs",
     ]
+    if model:
+        cmd += ["--model", model]
     if files:
         for f in files:
             cmd += ["--file", f]
@@ -312,11 +319,14 @@ def run_resume(
     attachments_path: str | None = None,
     tmp_path: str,
     files: list[str] | None = None,
+    model: str | None = None,
 ) -> tuple[str, int | None]:
     """Resume an existing OpenCode session with a follow-up *message*.
 
-    The model is determined by the existing session and is not passed on the
-    resume command line.
+    By default the model is decided by the existing session and not passed
+    on the resume command line.  When *model* is set, ``--model <model>``
+    is appended to the command line and overrides the session's model (the
+    CLI flag takes precedence over the session's configured model).
 
     Args:
         workspace_path: Path to the workspace directory (host side).
@@ -342,6 +352,10 @@ def run_resume(
         files: File paths to attach to the turn via ``--file``.  Each path is
             emitted as a ``--file <path>`` pair before the ``--`` separator.
             Defaults to ``None`` (no files).
+        model: Optional per-issue model override for the primary agent.  When
+            set, ``--model <model>`` is passed on the command line and beats
+            the session's configured model.  Defaults to ``None`` (session
+            model applies).
 
     Returns:
         A tuple of ``(final_message, context_tokens)`` where *context_tokens*
@@ -371,6 +385,8 @@ def run_resume(
         "--dangerously-skip-permissions",
         "--print-logs",
     ]
+    if model:
+        cmd += ["--model", model]
     if files:
         for f in files:
             cmd += ["--file", f]

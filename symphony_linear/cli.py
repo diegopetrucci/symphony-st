@@ -15,7 +15,7 @@ from symphony_linear.linear_tracker import LinearTracker
 from symphony_linear.logging import get_logger, setup_logging
 from symphony_linear.orchestrator import Orchestrator
 from symphony_linear.state import load_state
-from symphony_linear.tracker import Tracker
+from symphony_linear.tracker import Tracker, model_label_name
 from symphony_linear.webhook import WebhookServer
 
 logger = get_logger(__name__)
@@ -83,8 +83,9 @@ def main(argv: list[str] | None = None) -> None:
     state = load_state(workspace)
     tracker = _create_tracker(config)
 
-    # Auto-provision the trigger field/label on startup.
-    tracker.ensure_trigger_setup(state)
+    # Auto-provision the trigger field/label and model alias labels on startup.
+    model_labels = [model_label_name(alias) for alias in config.models]
+    tracker.ensure_trigger_setup(state, model_labels)
 
     # Create and run the orchestrator daemon.
     orchestrator = Orchestrator(

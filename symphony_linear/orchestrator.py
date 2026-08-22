@@ -38,6 +38,7 @@ from symphony_linear.tracker import (
     TrackerTransientError,
     TransitionTarget,
     is_bot_comment,
+    model_from_labels,
 )
 from symphony_linear.webhook import WebhookServer
 from symphony_linear.workspace import (
@@ -348,7 +349,11 @@ class Orchestrator:
             # pending is not None here (the nothing-to-replay branch returned
             # above); replay_message being set is what makes the resume a
             # recovery re-run rather than a fresh human-input turn.
-            self._resume_pipeline(ticket_state, replay_message=pending)
+            self._resume_pipeline(
+                ticket_state,
+                model_from_labels(issue.labels, self._config.models),
+                replay_message=pending,
+            )
         else:
             self._post_comment_safe(
                 tid,
@@ -453,7 +458,12 @@ class Orchestrator:
                             # carrying the pending comment into the prompt.
                             if existing.session_id:
                                 self._schedule_task(
-                                    issue.id, self._resume_pipeline, existing
+                                    issue.id,
+                                    self._resume_pipeline,
+                                    existing,
+                                    model_from_labels(
+                                        issue.labels, self._config.models
+                                    ),
                                 )
                             else:
                                 self._schedule_task(
@@ -702,8 +712,20 @@ class Orchestrator:
                         tid, self._rerun_interrupted_turn, ticket_state, fetched
                     )
                 elif st in (TicketStatus.needs_input, TicketStatus.failed):
+                    tracked_issue = issues_by_id.get(tid)
                     if ticket_state.session_id:
-                        self._schedule_task(tid, self._resume_pipeline, ticket_state)
+                        # Resolve the per-issue model override from the freshly
+                        # fetched issue.  When the ticket is not in the trigger
+                        # list this tick there is no Issue at hand — pass None
+                        # rather than making an extra tracker API call.
+                        model = (
+                            model_from_labels(tracked_issue.labels, self._config.models)
+                            if tracked_issue is not None
+                            else None
+                        )
+                        self._schedule_task(
+                            tid, self._resume_pipeline, ticket_state, model
+                        )
                     else:
                         # No session and no setup_error (failed + setup_error is
                         # skipped above): run the full initial turn so the agent
@@ -712,7 +734,6 @@ class Orchestrator:
                         # same gate _resume_pipeline applies, so a turn never
                         # starts out of nowhere.  Tickets not in the trigger
                         # list (e.g. cleanup-refused ones) are left alone.
-                        tracked_issue = issues_by_id.get(tid)
                         if tracked_issue is not None:
                             pending = self._pending_human_comments(
                                 tid, ticket_state.last_seen_comment_id
@@ -1155,6 +1176,11 @@ class Orchestrator:
         if self._is_cancelled(tid):
             return
 
+        # Per-issue model override for the primary agent, resolved from the
+        # freshly fetched issue's labels.  Nothing is persisted: changing or
+        # removing the label takes effect on the next turn.
+        model = model_from_labels(issue.labels, self._config.models)
+
         # --- Resolve repository URL ---
         try:
             repo_url = self._tracker.repo_url_for(issue)
@@ -1478,6 +1504,7 @@ class Orchestrator:
                 attachments_path=host_attachments_dir,
                 tmp_path=tmp_path,
                 files=files,
+                model=model,
             )
         except OpenCodeTimeout as exc:
             logger.error("OpenCode turn timed out for %s", tid)
@@ -1550,7 +1577,9 @@ class Orchestrator:
             return
 
         # --- Post final message ---
-        last_comment = self._post_final_message(tid, final_message, _context_tokens)
+        last_comment = self._post_final_message(
+            tid, final_message, _context_tokens, model
+        )
         if last_comment is None:
             return  # state saved as failed inside _post_final_message
         ticket_state.last_seen_comment_id = last_comment.id
@@ -1588,9 +1617,18 @@ class Orchestrator:
     # ==================================================================
 
     def _resume_pipeline(
-        self, ticket_state: TicketState, *, replay_message: str | None = None
+        self,
+        ticket_state: TicketState,
+        model: str | None = None,
+        *,
+        replay_message: str | None = None,
     ) -> None:
         """Resume an existing OpenCode session with new human comments.
+
+        *model* is the per-issue model override for the primary agent,
+        resolved by the caller from the freshly fetched issue's labels
+        (``None`` when no override applies); it is passed through to
+        ``opencode run --model`` and recorded in the final-comment footer.
 
         When *replay_message* is provided, the pipeline is a recovery re-run
         of an interrupted turn: the comment fetch and the new-comment gate
@@ -1752,6 +1790,7 @@ class Orchestrator:
                 attachments_path=host_attachments_dir,
                 tmp_path=tmp_path,
                 files=files_attach,
+                model=model,
             )
         except OpenCodeTimeout as exc:
             logger.error("OpenCode resume timed out for %s", tid)
@@ -1803,7 +1842,9 @@ class Orchestrator:
             logger.info("Ticket %s cancelled before final message — skipping", tid)
             return
 
-        last_comment = self._post_final_message(tid, final_message, _context_tokens)
+        last_comment = self._post_final_message(
+            tid, final_message, _context_tokens, model
+        )
         if last_comment is None:
             return
         ticket_state.last_seen_comment_id = last_comment.id
@@ -1877,7 +1918,11 @@ class Orchestrator:
             return None
 
     def _post_final_message(
-        self, tid: str, final_message: str, context_tokens: int | None = None
+        self,
+        tid: str,
+        final_message: str,
+        context_tokens: int | None = None,
+        model: str | None = None,
     ) -> Comment | None:
         if self._is_cancelled(tid):
             return None
@@ -1886,6 +1931,10 @@ class Orchestrator:
             kind = f"context: {context_tokens:,} tokens"
         else:
             kind = "final"
+        if model:
+            # Middle dot (U+00B7) separator, the same one the footer already
+            # uses — keeps is_bot_comment detection working.
+            kind += f" · model: {model}"
         try:
             return self._tracker.post_comment(tid, body, kind)
         except Exception:

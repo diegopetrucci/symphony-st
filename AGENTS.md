@@ -184,6 +184,20 @@ shutting down, or the ticket is no longer triggered — see `_is_still_triggered
   stdout/stderr tail, and the ticket is transitioned back to
   `needs_input_state` to avoid a respawn loop — except clean exits within
   10s, which are silent (the script is assumed to have daemonized a child).
+- **Per-issue model override via `Model: <value>` labels.** Resolved per
+  turn from the freshly fetched issue's labels by `model_from_labels` in
+  `tracker.py` (case-insensitive prefix match; value looked up in the
+  top-level `models:` alias map case-insensitively, passed through verbatim
+  on a miss). The resolved id becomes `--model` on `opencode run` for the
+  primary agent's turns, initial and resume; subagents are unaffected.
+  Nothing is persisted — changing or removing the label takes effect on
+  the next turn. The final-comment footer kind appends
+  `· model: <id>` when overridden (the middle dot is the U+00B7 footer
+  separator, so `is_bot_comment` still matches). One `Model: <alias>` label
+  per configured alias is provisioned on Linear at startup alongside the
+  trigger label (`provision_model_labels`, no state caching — unlike the
+  trigger label it re-checks every start); the GitHub backend ignores the
+  list, since its labels are per-repository and a project spans repos.
 
 ## Running and testing
 

@@ -316,6 +316,12 @@ linear:
   # disable the feature entirely.
   # qa_state: QA
 
+# Optional. Per-issue model overrides, keyed by alias. See "Per-issue
+# model override" below.
+# models:
+#   Strong: anthropic/claude-opus-5
+#   Cheap: openai/gpt-5-mini
+
 sandbox:
   # Paths to conceal from the agent inside the sandbox. Directories become
   # an empty tmpfs; files and sockets are replaced with /dev/null. ~ and
@@ -351,6 +357,37 @@ turn_idle_timeout_seconds: 1200
 ```
 
 A copy of this example lives at `config.yaml.example` in the repo root.
+
+### Per-issue model override
+
+A `Model: <value>` label on an issue picks the model for that ticket's
+primary agent. The daemon passes `--model` to `opencode run` on every turn
+for that ticket, first turn and resumes alike. Subagents keep their own
+models.
+
+The value is looked up case-insensitively in the top-level `models` map:
+
+```yaml
+models:
+  Strong: anthropic/claude-opus-5
+  Cheap: openai/gpt-5-mini
+```
+
+A value that is not in the map is used verbatim, so a raw provider/model id
+works with no config change:
+
+- `Model: Strong` → `--model anthropic/claude-opus-5`
+- `Model: anthropic/claude-sonnet-4-6` → `--model anthropic/claude-sonnet-4-6`
+
+On Linear, one label per alias (`Model: Strong`, `Model: Cheap`) is created
+at startup, next to the trigger label. On GitHub, labels are per-repository,
+so create them yourself.
+
+Nothing is persisted. Change the label and the next turn uses the new model;
+remove it and the agent's own model applies again. The final comment names
+the model when one was resolved. Model ids are not validated: a bad value
+makes OpenCode exit at once, and the ticket lands in Needs Input with the
+error.
 
 ### Webhook (optional)
 

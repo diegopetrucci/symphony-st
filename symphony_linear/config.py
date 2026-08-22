@@ -185,6 +185,14 @@ class AppConfig(BaseModel):
     webhook: _WebhookConfig | None = Field(
         None, description="Optional webhook server configuration"
     )
+    models: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Per-issue model override aliases: alias -> full provider/model id. "
+            "A 'Model: <alias or id>' label on an issue makes the daemon pass "
+            "--model to opencode run for that ticket's primary-agent turns."
+        ),
+    )
     poll_interval_seconds: int = Field(
         30, gt=0, description="Seconds between poll cycles"
     )

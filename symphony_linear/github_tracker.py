@@ -545,12 +545,18 @@ class GitHubTracker:
     # Tracker protocol — Trigger setup
     # ------------------------------------------------------------------
 
-    def ensure_trigger_setup(self, state: StateManager) -> None:
+    def ensure_trigger_setup(
+        self, state: StateManager, model_labels: list[str]
+    ) -> None:
         """Idempotently ensure the project is resolved and the trigger field
         exists on the project.
 
         If the field already exists it is reused; otherwise it is created
         as a ``SINGLE_SELECT`` with one option named ``on``.
+
+        *model_labels* is ignored: GitHub labels are per-repository and one
+        project spans many repos, so there is no single repo to create
+        them in.
         """
         if self._project_node_id is None:
             self.resolve()
@@ -631,6 +637,8 @@ class GitHubTracker:
                 clone_url = self._repo_clone_url(repo)
                 name_with_owner = repo.get("nameWithOwner")
 
+                labels_conn = content.get("labels") or {}
+
                 issue = Issue(
                     id=issue_id,
                     identifier=(
@@ -645,7 +653,7 @@ class GitHubTracker:
                     ),
                     title=content.get("title", ""),
                     state=status_name,
-                    labels=[],
+                    labels=[n["name"] for n in labels_conn.get("nodes") or []],
                     branchName=None,
                     project=None,
                     updatedAt=content.get("updatedAt", ""),
@@ -689,6 +697,11 @@ class GitHubTracker:
                       title
                       state
                       updatedAt
+                      labels(first: 50) {
+                        nodes {
+                          name
+                        }
+                      }
                       repository {
                         sshUrl
                         url
@@ -735,6 +748,8 @@ class GitHubTracker:
         name_with_owner = repo.get("nameWithOwner")
         clone_url = self._repo_clone_url(repo)
 
+        labels_conn = raw.get("labels") or {}
+
         # 2. Find the project item to get its Status field value.
         status_name = ""
         with self._item_map_lock:
@@ -765,7 +780,7 @@ class GitHubTracker:
             title=raw.get("title", ""),
             description=raw.get("body"),
             state=status_name,
-            labels=[],
+            labels=[n["name"] for n in labels_conn.get("nodes") or []],
             branchName=None,
             project=None,
             updatedAt=raw.get("updatedAt", ""),
@@ -818,6 +833,11 @@ class GitHubTracker:
               body
               state
               updatedAt
+              labels(first: 50) {
+                nodes {
+                  name
+                }
+              }
               repository {
                 sshUrl
                 url

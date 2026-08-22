@@ -13,7 +13,7 @@ import httpx
 
 from symphony_linear.config import _LinearConfig
 from symphony_linear.linear import Comment, Issue, LinearClient
-from symphony_linear.provisioning import provision_trigger_label
+from symphony_linear.provisioning import provision_model_labels, provision_trigger_label
 from symphony_linear.state import StateManager
 from symphony_linear.tracker import (
     AttachmentDownloadError,
@@ -262,12 +262,15 @@ class LinearTracker:
     def transition_name_for(self, target: TransitionTarget) -> str:
         return _target_to_linear_state_name(target, self._config)
 
-    def ensure_trigger_setup(self, state: StateManager) -> None:
+    def ensure_trigger_setup(
+        self, state: StateManager, model_labels: list[str]
+    ) -> None:
         # Delegate to the existing provisioning logic so we don't duplicate
         # the race-tolerant find/create/retry flow.  Calls into provisioning.py
         # which uses the LinearClient directly.  This will be inlined or
         # restructured in the follow-up migration ticket if needed.
         provision_trigger_label(self._linear, state, self._config.trigger_label)
+        provision_model_labels(self._linear, model_labels)
 
     def human_trigger_description(self) -> str:
         return f"remove the `{self._config.trigger_label}` label"

@@ -6,12 +6,15 @@ knowing whether it is talking to Linear, GitHub, or another issue tracker.
 
 from __future__ import annotations
 
+import logging
 from enum import Enum
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Mapping, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from symphony_linear.linear import Comment, Issue
     from symphony_linear.state import StateManager
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -24,6 +27,64 @@ _BOT_MARKER = "*Symphony · "
 def is_bot_comment(body: str) -> bool:
     """Return ``True`` if *body* contains the Symphony footer marker."""
     return _BOT_MARKER in body
+
+
+# ---------------------------------------------------------------------------
+# Per-issue model override resolution
+# ---------------------------------------------------------------------------
+
+_MODEL_LABEL_PREFIX = "model:"
+
+
+def model_label_name(alias: str) -> str:
+    """Return the workspace label name for a model *alias*: ``Model: <alias>``.
+
+    Built from ``_MODEL_LABEL_PREFIX`` so the provisioning side and
+    ``model_from_labels`` can never drift apart.
+    """
+    return f"{_MODEL_LABEL_PREFIX.capitalize()} {alias}"
+
+
+def model_from_labels(labels: list[str], aliases: Mapping[str, str]) -> str | None:
+    """Resolve a per-issue model override from ``Model: <value>`` labels.
+
+    A label whose stripped name starts with ``model:`` (case-insensitive)
+    names the model for the ticket's primary-agent turns.  The remainder of
+    the label is the value: it is looked up in *aliases*
+    case-insensitively (mapping short names to full ``provider/model`` ids),
+    and returned verbatim on a miss so a raw provider/model id works with
+    no config entry.  Empty values are ignored (with a warning).  When
+    several labels match, the first in sorted order with a non-empty
+    value wins (with a warning).
+
+    Returns ``None`` when no label matches.  Config-agnostic: *aliases* is
+    a plain mapping, not an ``AppConfig``.
+    """
+    matches: list[str] = []
+    for label in labels:
+        stripped = label.strip()
+        if stripped.lower().startswith(_MODEL_LABEL_PREFIX):
+            matches.append(stripped)
+
+    if not matches:
+        return None
+
+    matches.sort()
+    lowered_aliases = {name.lower(): model_id for name, model_id in aliases.items()}
+    for candidate in matches:
+        value = candidate[len(_MODEL_LABEL_PREFIX) :].strip()
+        if not value:
+            logger.warning("Ignoring Model: label %r — empty value", candidate)
+            continue
+        if len(matches) > 1:
+            logger.warning(
+                "Multiple Model: labels on ticket (%s) — using %r",
+                ", ".join(matches),
+                candidate,
+            )
+        return lowered_aliases.get(value.lower(), value)
+
+    return None
 
 
 def normalise_content_type(value: str | None) -> str | None:
@@ -207,11 +268,18 @@ class Tracker(Protocol):
         """
         ...
 
-    def ensure_trigger_setup(self, state: StateManager) -> None:
+    def ensure_trigger_setup(
+        self, state: StateManager, model_labels: list[str]
+    ) -> None:
         """Idempotently ensure the trigger label exists in the tracker.
 
         Called once on daemon startup.  Must not raise on transient
         failures — the daemon must tolerate missing labels.
+
+        *model_labels* are the workspace label names for the configured
+        model aliases (see ``model_label_name``), to be provisioned
+        alongside the trigger label.  Backends that cannot provision them
+        (e.g. no workspace-wide label concept) may ignore them.
         """
         ...
 

@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 
 from symphony_linear.linear import LinearError
-from symphony_linear.provisioning import provision_trigger_label
+from symphony_linear.provisioning import provision_model_labels, provision_trigger_label
 from symphony_linear.state import StateManager
 
 
@@ -229,3 +229,87 @@ class TestExceptionDoesNotPropagate:
         assert "Failed to auto-provision Linear label 'Agent'" in caplog.text
         assert "disk full" in caplog.text
         state.set_provisioned_label_name.assert_called_once_with("Agent")
+
+
+class TestProvisionModelLabels:
+    def test_creates_missing_labels(self) -> None:
+        """Missing labels are each created via find→create."""
+        linear = _fake_linear(find_id=None, create_id="lbl-new")
+
+        provision_model_labels(linear, ["Model: Strong", "Model: Cheap"])
+
+        linear.find_workspace_label.assert_has_calls(
+            [call("Model: Strong"), call("Model: Cheap")]
+        )
+        linear.create_workspace_label.assert_has_calls(
+            [call("Model: Strong"), call("Model: Cheap")]
+        )
+
+    def test_existing_label_not_recreated(self) -> None:
+        """A label that already exists is found but never created."""
+        linear = _fake_linear(find_id="lbl-existing")
+
+        provision_model_labels(linear, ["Model: Strong"])
+
+        linear.find_workspace_label.assert_called_once_with("Model: Strong")
+        linear.create_workspace_label.assert_not_called()
+
+    def test_find_error_warns_and_does_not_raise(self, caplog) -> None:
+        """A failing find warns and does not raise or attempt a create."""
+        linear = _fake_linear(find_error=LinearError("Network down"))
+
+        with caplog.at_level(logging.WARNING):
+            provision_model_labels(linear, ["Model: Strong"])
+
+        assert "Failed to auto-provision Linear label 'Model: Strong'" in caplog.text
+        assert "Network down" in caplog.text
+        linear.create_workspace_label.assert_not_called()
+
+    def test_create_error_warns_and_does_not_raise(self, caplog) -> None:
+        """A failing create (and retry-find) warns and does not raise."""
+        linear = MagicMock()
+        linear.find_workspace_label.side_effect = [None, None]
+        linear.create_workspace_label.side_effect = LinearError("Permission denied")
+
+        with caplog.at_level(logging.WARNING):
+            provision_model_labels(linear, ["Model: Strong"])
+
+        assert "Failed to auto-provision Linear label 'Model: Strong'" in caplog.text
+        assert "Permission denied" in caplog.text
+        assert linear.find_workspace_label.call_count == 2
+
+    def test_create_error_race_resolved_succeeds(self, caplog) -> None:
+        """Create fails (race), retry-find finds the label – no warning."""
+        linear = MagicMock()
+        linear.find_workspace_label.side_effect = [None, "lbl-race"]
+        linear.create_workspace_label.side_effect = LinearError("Already exists")
+
+        with caplog.at_level(logging.WARNING):
+            provision_model_labels(linear, ["Model: Strong"])
+
+        assert linear.find_workspace_label.call_count == 2
+        assert not caplog.records
+
+    def test_continues_after_one_failure(self, caplog) -> None:
+        """One label failing to provision doesn't stop the remaining labels."""
+        linear = MagicMock()
+        linear.find_workspace_label.side_effect = [
+            LinearError("Network down"),
+            "lbl-ok",
+        ]
+
+        with caplog.at_level(logging.WARNING):
+            provision_model_labels(linear, ["Model: Strong", "Model: Cheap"])
+
+        assert "Failed to auto-provision Linear label 'Model: Strong'" in caplog.text
+        assert linear.find_workspace_label.call_count == 2
+        linear.create_workspace_label.assert_not_called()
+
+    def test_empty_labels_no_api_calls(self) -> None:
+        """An empty alias map does nothing."""
+        linear = _fake_linear()
+
+        provision_model_labels(linear, [])
+
+        linear.find_workspace_label.assert_not_called()
+        linear.create_workspace_label.assert_not_called()

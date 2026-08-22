@@ -962,6 +962,98 @@ class TestFilesArgv:
 
 
 # ---------------------------------------------------------------------------
+# Unit: --model flag argv construction
+# ---------------------------------------------------------------------------
+
+
+class TestModelFlag:
+    """A per-issue model override must reach argv as --model <id> on both
+    the initial and the resume command, before the ``--`` separator."""
+
+    @staticmethod
+    def _make_fake_popen() -> _FakePopen:
+        events = [
+            {"type": "step_start", "sessionID": "ses_test", "part": {}},
+            {"type": "text", "sessionID": "ses_test", "part": {"text": "ok"}},
+            {"type": "step_finish", "sessionID": "ses_test", "part": {}},
+        ]
+        stdout = "\n".join(json.dumps(e) for e in events).encode()
+        return _FakePopen(stdout=stdout, exit_code=0)
+
+    def test_run_initial_with_model(self) -> None:
+        fake_proc = self._make_fake_popen()
+        with patch(
+            "symphony_linear.opencode.run_in_sandbox", return_value=fake_proc
+        ) as mock_sandbox:
+            run_initial(
+                workspace_path="/ws",
+                tmp_path="/ws/tmp",
+                prompt="hello",
+                timeout_seconds=60,
+                idle_timeout_seconds=60,
+                on_subprocess=lambda p: None,
+                model="anthropic/claude-opus-5",
+            )
+        cmd = mock_sandbox.call_args.kwargs["cmd"]
+        idx = cmd.index("--model")
+        assert cmd[idx + 1] == "anthropic/claude-opus-5"
+        assert idx < cmd.index("--")
+
+    def test_run_initial_without_model(self) -> None:
+        fake_proc = self._make_fake_popen()
+        with patch(
+            "symphony_linear.opencode.run_in_sandbox", return_value=fake_proc
+        ) as mock_sandbox:
+            run_initial(
+                workspace_path="/ws",
+                tmp_path="/ws/tmp",
+                prompt="hello",
+                timeout_seconds=60,
+                idle_timeout_seconds=60,
+                on_subprocess=lambda p: None,
+            )
+        cmd = mock_sandbox.call_args.kwargs["cmd"]
+        assert "--model" not in cmd
+
+    def test_run_resume_with_model(self) -> None:
+        fake_proc = self._make_fake_popen()
+        with patch(
+            "symphony_linear.opencode.run_in_sandbox", return_value=fake_proc
+        ) as mock_sandbox:
+            run_resume(
+                workspace_path="/ws",
+                tmp_path="/ws/tmp",
+                session_id="ses_x",
+                message="continue",
+                timeout_seconds=60,
+                idle_timeout_seconds=60,
+                on_subprocess=lambda p: None,
+                model="anthropic/claude-opus-5",
+            )
+        cmd = mock_sandbox.call_args.kwargs["cmd"]
+        idx = cmd.index("--model")
+        assert cmd[idx + 1] == "anthropic/claude-opus-5"
+        assert idx < cmd.index("--")
+
+    def test_run_resume_without_model(self) -> None:
+        fake_proc = self._make_fake_popen()
+        with patch(
+            "symphony_linear.opencode.run_in_sandbox", return_value=fake_proc
+        ) as mock_sandbox:
+            run_resume(
+                workspace_path="/ws",
+                tmp_path="/ws/tmp",
+                session_id="ses_x",
+                message="continue",
+                timeout_seconds=60,
+                idle_timeout_seconds=60,
+                on_subprocess=lambda p: None,
+            )
+        cmd = mock_sandbox.call_args.kwargs["cmd"]
+        assert "--model" not in cmd
+
+
+# ---------------------------------------------------------------------------
 # Unit: empty-session guard
 # ---------------------------------------------------------------------------
 

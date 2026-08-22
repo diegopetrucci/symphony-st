@@ -124,8 +124,13 @@ def _issue_item(
     repo_ssh_url: str = "git@github.com:my-org/my-repo.git",
     repo_https_url: str = "https://github.com/my-org/my-repo",
     updated_at: str = "2025-01-01T00:00:00Z",
+    labels: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Build a project-item node dict."""
+    """Build a project-item node dict.
+
+    ``labels=None`` (the default) omits the ``labels`` key entirely so
+    tests can exercise the tolerant missing-key extraction path.
+    """
 
     field_values: list[dict[str, Any]] = []
     if trigger_on:
@@ -152,21 +157,25 @@ def _issue_item(
         }
     )
 
+    content: dict[str, Any] = {
+        "__typename": "Issue",
+        "id": issue_id,
+        "number": number,
+        "title": title,
+        "state": state,
+        "updatedAt": updated_at,
+        "repository": {
+            "sshUrl": repo_ssh_url,
+            "url": repo_https_url,
+            "nameWithOwner": repo_name,
+        },
+    }
+    if labels is not None:
+        content["labels"] = {"nodes": [{"name": name} for name in labels]}
+
     return {
         "id": item_id,
-        "content": {
-            "__typename": "Issue",
-            "id": issue_id,
-            "number": number,
-            "title": title,
-            "state": state,
-            "updatedAt": updated_at,
-            "repository": {
-                "sshUrl": repo_ssh_url,
-                "url": repo_https_url,
-                "nameWithOwner": repo_name,
-            },
-        },
+        "content": content,
         "fieldValues": {"nodes": field_values},
     }
 
@@ -710,11 +719,28 @@ class TestTriggerField:
         state = StateManager(tmp_path / "state.json")
         state.load()
 
-        tracker.ensure_trigger_setup(state)
+        # Model labels are passed but ignored: GitHub labels are
+        # per-repository and one project spans many repos.
+        tracker.ensure_trigger_setup(state, ["Model: Strong", "Model: Cheap"])
 
         assert tracker._project_node_id == "PVT_p1"
         assert tracker._trigger_field_id == "PVTSSF_sym"
         assert tracker._trigger_option_id == "opt_on"
+
+    def test_ensure_trigger_setup_ignores_model_labels_when_resolved(
+        self, client_mock: MagicMock, config: GitHubTrackerConfig, tmp_path: Any
+    ) -> None:
+        tracker = GitHubTracker(client_mock, config)
+        tracker._project_node_id = "PVT_p1"
+
+        state = StateManager(tmp_path / "state.json")
+        state.load()
+
+        tracker.ensure_trigger_setup(state, ["Model: Strong"])
+
+        # No queries at all: model labels are ignored and the project is
+        # already resolved.
+        client_mock._query.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -748,11 +774,76 @@ class TestListTriggeredIssues:
         assert issues[0].identifier == "my-org-my-repo-42"
         assert issues[0].title == "Fix bug"
         assert issues[0].state == "In Progress"
+        # No labels key in the payload — extraction must tolerate it.
         assert issues[0].labels == []
         assert issues[0].tracker_data == {
             "clone_url": "git@github.com:my-org/my-repo.git",
             "project_item_id": "PVTI_1",
         }
+
+        # The project-items query must select the labels connection.
+        call = client_mock._query.call_args
+        assert call is not None
+        assert "labels(first: 50)" in call[0][0]
+
+    def test_surfaces_labels(
+        self, tracker: GitHubTracker, client_mock: MagicMock
+    ) -> None:
+        client_mock._query.return_value = {
+            "node": {
+                "items": {
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    "nodes": [
+                        _issue_item(
+                            item_id="PVTI_1",
+                            issue_id="I_1",
+                            number=42,
+                            title="Fix bug",
+                            labels=["Model: strong", "bug"],
+                        ),
+                    ],
+                }
+            }
+        }
+        issues = tracker.list_triggered_issues()
+        assert len(issues) == 1
+        assert issues[0].labels == ["Model: strong", "bug"]
+
+    def test_surfaces_empty_labels_nodes(
+        self, tracker: GitHubTracker, client_mock: MagicMock
+    ) -> None:
+        client_mock._query.return_value = {
+            "node": {
+                "items": {
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    "nodes": [
+                        _issue_item(issue_id="I_1", labels=[]),
+                    ],
+                }
+            }
+        }
+        issues = tracker.list_triggered_issues()
+        assert len(issues) == 1
+        assert issues[0].labels == []
+
+    def test_tolerates_null_labels(
+        self, tracker: GitHubTracker, client_mock: MagicMock
+    ) -> None:
+        # The labels connection is nullable — an explicit null (not just a
+        # missing key) must be tolerated.
+        item = _issue_item(issue_id="I_1")
+        item["content"]["labels"] = None
+        client_mock._query.return_value = {
+            "node": {
+                "items": {
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    "nodes": [item],
+                }
+            }
+        }
+        issues = tracker.list_triggered_issues()
+        assert len(issues) == 1
+        assert issues[0].labels == []
 
     def test_filters_closed_issues(
         self, tracker: GitHubTracker, client_mock: MagicMock
@@ -996,6 +1087,7 @@ class TestGetIssue:
                     "body": "Description text",
                     "state": "OPEN",
                     "updatedAt": "2025-01-01T00:00:00Z",
+                    "labels": {"nodes": [{"name": "Model: strong"}]},
                     "repository": {
                         "sshUrl": "git@github.com:my-org/my-repo.git",
                         "url": "https://github.com/my-org/my-repo",
@@ -1012,8 +1104,63 @@ class TestGetIssue:
         assert issue.identifier == "my-org-my-repo-42"
         assert issue.description == "Description text"
         assert issue.state == "In Progress"
+        assert issue.labels == ["Model: strong"]
         assert issue.tracker_data is not None
         assert issue.tracker_data["clone_url"] == "git@github.com:my-org/my-repo.git"
+
+    def test_tolerates_null_labels(
+        self, tracker: GitHubTracker, client_mock: MagicMock
+    ) -> None:
+        # The labels connection is nullable — an explicit null on the raw
+        # issue payload must be tolerated like a missing key.
+        def side_effect(
+            query: str, variables: dict[str, Any] | None = None, **kwargs: Any
+        ) -> dict[str, Any]:
+            if "comments" in query and "fieldValues" not in query:
+                # Paginated comment query.
+                return {
+                    "node": {
+                        "comments": {
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                            "nodes": [],
+                        }
+                    }
+                }
+            if "fieldValues" in query:
+                # Item field values query.
+                return {
+                    "node": {
+                        "fieldValues": {
+                            "nodes": [
+                                {"field": {"name": "Status"}, "name": "In Progress"},
+                            ],
+                        }
+                    }
+                }
+            # _fetch_issue_raw query.
+            return {
+                "node": {
+                    "__typename": "Issue",
+                    "id": "I_1",
+                    "number": 42,
+                    "title": "Test",
+                    "body": None,
+                    "state": "OPEN",
+                    "updatedAt": "2025-01-01T00:00:00Z",
+                    "labels": None,
+                    "repository": {
+                        "sshUrl": "git@github.com:my-org/my-repo.git",
+                        "url": "https://github.com/my-org/my-repo",
+                        "nameWithOwner": "my-org/my-repo",
+                    },
+                }
+            }
+
+        client_mock._query.side_effect = side_effect
+        tracker._item_id_map["I_1"] = "PVTI_1"
+
+        issue = tracker.get_issue("I_1")
+        assert issue.labels == []
 
     def test_not_found_raises(
         self, tracker: GitHubTracker, client_mock: MagicMock
@@ -1096,6 +1243,8 @@ class TestGetIssue:
 
         issue = tracker.get_issue("I_1")
         assert issue.state == "In Progress"
+        # No labels key in the raw payload — extraction must tolerate it.
+        assert issue.labels == []
         with tracker._item_map_lock:
             assert tracker._item_id_map == {"I_1": "PVTI_1"}
 

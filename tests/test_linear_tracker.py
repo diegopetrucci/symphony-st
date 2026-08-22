@@ -404,11 +404,39 @@ class TestEnsureTriggerSetup:
         # provision_trigger_label is imported at module top-level in
         # linear_tracker.py; we patch the reference in that module so the
         # test doesn't require a real Linear connection.
-        with patch(
-            "symphony_linear.linear_tracker.provision_trigger_label"
-        ) as mock_provision:
-            tracker.ensure_trigger_setup(state)
+        with (
+            patch(
+                "symphony_linear.linear_tracker.provision_trigger_label"
+            ) as mock_provision,
+            patch(
+                "symphony_linear.linear_tracker.provision_model_labels"
+            ) as mock_models,
+        ):
+            tracker.ensure_trigger_setup(state, ["Model: Strong", "Model: Cheap"])
             mock_provision.assert_called_once_with(linear_mock, state, "Agent")
+            mock_models.assert_called_once_with(
+                linear_mock, ["Model: Strong", "Model: Cheap"]
+            )
+
+    def test_empty_model_labels_provisions_nothing_extra(
+        self, tracker: LinearTracker, linear_mock: MagicMock, tmp_path: Any
+    ) -> None:
+        from unittest.mock import patch
+
+        state = StateManager(tmp_path / "state.json")
+        state.load()
+
+        with (
+            patch(
+                "symphony_linear.linear_tracker.provision_trigger_label"
+            ) as mock_provision,
+            patch(
+                "symphony_linear.linear_tracker.provision_model_labels"
+            ) as mock_models,
+        ):
+            tracker.ensure_trigger_setup(state, [])
+            mock_provision.assert_called_once_with(linear_mock, state, "Agent")
+            mock_models.assert_called_once_with(linear_mock, [])
 
 
 class TestHumanTriggerDescription:
