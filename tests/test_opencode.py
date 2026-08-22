@@ -23,6 +23,7 @@ import pytest
 from symphony_linear.opencode import (
     OpenCodeError,
     OpenCodeTimeout,
+    _assemble_final_reply,
     _assemble_message,
     _extract_context_tokens,
     _parse_stream,
@@ -269,6 +270,147 @@ class TestAssembleMessage:
 
 
 # ---------------------------------------------------------------------------
+# Unit: trimmed final-reply assembly (success path)
+# ---------------------------------------------------------------------------
+
+
+class TestAssembleFinalReply:
+    """Verify the trimmed final-reply assembly used on successful turns.
+
+    Success-path comments must contain only the closing reply: no tool-title
+    lines, no mid-turn narration, no subagent chatter.  A turn that ends on a
+    tool call falls back to the full assembly.
+    """
+
+    def test_tool_calls_keep_only_closing_reply(self) -> None:
+        """Text before/between tool calls is dropped; only the text after the
+        last tool_use survives, with no tool-title lines."""
+        events = [
+            _make_text("Let me check that for you."),
+            _make_tool_use(tool="bash", title="Running shell command"),
+            _make_text("Halfway there, still working."),
+            _make_tool_use(tool="read", title="Reading file"),
+            _make_text("Done. Here is the full answer."),
+        ]
+        result = _assemble_final_reply(events, "ses_test")
+        assert result == "Done. Here is the full answer."
+
+    def test_no_tool_use_keeps_all_text(self) -> None:
+        """Without any tool_use, all text segments survive (nothing to trim)."""
+        events = [
+            _make_text("First burst."),
+            _make_text("Second burst."),
+        ]
+        result = _assemble_final_reply(events, "ses_test")
+        assert result == "First burst.\n\nSecond burst."
+
+    def test_turn_ending_on_tool_call_falls_back_to_full_assembly(self) -> None:
+        """No text after the last tool_use → fall back to the full trace, so
+        the comment is never empty."""
+        events = [
+            _make_text("Let me check that for you."),
+            _make_tool_use(tool="bash", title="Running shell command"),
+            _make_text("Halfway there, still working."),
+            _make_tool_use(tool="read", title="Reading file"),
+        ]
+        result = _assemble_final_reply(events, "ses_test")
+        assert result == (
+            "Let me check that for you.\n\n*Running shell command*\n\n"
+            "Halfway there, still working.\n\n*Reading file*"
+        )
+
+    def test_foreign_session_events_are_dropped(self) -> None:
+        """Events whose top-level sessionID differs from the main session
+        (subagent chatter) never appear in the trimmed reply — even when they
+        fall after the main session's last tool_use."""
+        events = [
+            _make_text("Main session intro."),
+            _make_tool_use(tool="read", title="Reading file"),
+            {
+                "type": "tool_use",
+                "sessionID": "ses_sub",
+                "part": {
+                    "type": "tool-use",
+                    "tool": "bash",
+                    "state": {"title": "Subagent tool", "status": "running"},
+                },
+            },
+            {
+                "type": "text",
+                "sessionID": "ses_sub",
+                "part": {"type": "text", "text": "Subagent chatter."},
+            },
+            _make_text("Closing reply."),
+        ]
+        result = _assemble_final_reply(events, "ses_test")
+        assert result == "Closing reply."
+
+    def test_foreign_session_tool_use_does_not_reset_trim_window(self) -> None:
+        """A subagent tool_use must not count as the last tool_use: the main
+        session's own last tool call is what delimits the closing reply."""
+        events = [
+            _make_text("Intro."),
+            _make_tool_use(tool="bash", title="Main tool"),
+            {
+                "type": "text",
+                "sessionID": "ses_sub",
+                "part": {"type": "text", "text": "Subagent chatter."},
+            },
+            {
+                "type": "tool_use",
+                "sessionID": "ses_sub",
+                "part": {
+                    "type": "tool-use",
+                    "tool": "bash",
+                    "state": {"title": "Subagent tool", "status": "running"},
+                },
+            },
+            _make_text("Closing reply."),
+        ]
+        result = _assemble_final_reply(events, "ses_test")
+        assert result == "Closing reply."
+
+    def test_success_path_through_run_initial_returns_trimmed_reply(self) -> None:
+        """The _execute success path uses the trimmed assembly end to end."""
+        events = [
+            {"type": "step_start", "sessionID": "ses_main", "part": {}},
+            {
+                "type": "text",
+                "sessionID": "ses_main",
+                "part": {"type": "text", "text": "Working on it..."},
+            },
+            {
+                "type": "tool_use",
+                "sessionID": "ses_main",
+                "part": {
+                    "type": "tool-use",
+                    "tool": "bash",
+                    "state": {"title": "Running shell command", "status": "running"},
+                },
+            },
+            {
+                "type": "text",
+                "sessionID": "ses_main",
+                "part": {"type": "text", "text": "Done. The answer is 42."},
+            },
+            {"type": "step_finish", "sessionID": "ses_main", "part": {}},
+        ]
+        stdout = "\n".join(json.dumps(e) for e in events).encode()
+        proc = _FakePopen(stdout=stdout, exit_code=0)
+        with patch("symphony_linear.opencode.run_in_sandbox", return_value=proc):
+            session_id, final_message, _ = run_initial(
+                workspace_path="/ws",
+                tmp_path="/ws/tmp",
+                prompt="do it",
+                timeout_seconds=10,
+                idle_timeout_seconds=10,
+                on_subprocess=lambda p: None,
+            )
+        assert session_id == "ses_main"
+        assert final_message == "Done. The answer is 42."
+
+
+# ---------------------------------------------------------------------------
 # Unit: _parse_stream shared helper + OpenCodeTimeout
 # ---------------------------------------------------------------------------
 
@@ -453,6 +595,34 @@ class TestExecuteTimeout:
         assert proc.killed
         # The pre-buffered output was consumed, then the process went quiet.
         assert "no output" in exc.reason
+
+    def test_timeout_keeps_tool_titles_in_partial_message(self) -> None:
+        """The timeout path uses the full assembly, not the trimmed reply:
+        tool-title lines must survive in the salvaged partial message (they
+        are the only diagnostic on a killed turn)."""
+        stdout = (
+            json.dumps({"type": "step_start", "sessionID": "ses_tt", "part": {}})
+            + "\n"
+            + json.dumps(
+                {"type": "text", "sessionID": "ses_tt", "part": {"text": "Working..."}}
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "type": "tool_use",
+                    "sessionID": "ses_tt",
+                    "part": {
+                        "type": "tool-use",
+                        "tool": "bash",
+                        "state": {"title": "Installing deps", "status": "running"},
+                    },
+                }
+            )
+            + "\n"
+        ).encode()
+        proc = _FakePopen(stdout=stdout, exit_code=None)
+        exc = self._run_initial(proc, idle_timeout_seconds=0.2)
+        assert exc.partial_message == "Working...\n\n*Installing deps*"
 
     def test_idle_timeout_kills_silent_process(self) -> None:
         """(a) A process that stops producing output is killed at the idle

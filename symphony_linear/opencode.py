@@ -82,19 +82,30 @@ this module.
 
 Key observations:
 - ``sessionID`` appears at the top level of every event.  We grab it from the
-  first event we see.
-- The final assistant message is assembled from ``"text"`` and ``"tool_use"``
-  events in stream order:
+  first event we see; that value is the *main* (top-level) session.  Events
+  whose top-level ``sessionID`` differs come from subagent sessions.
+- Message assembly has two modes, serving different readers:
 
-  * ``"text"`` events contribute ``part.text`` (when non-empty).
-  * ``"tool_use"`` events contribute ``*<part.state.title>*`` when
-    ``part.state.title`` is a non-empty string; otherwise ``*<part.tool>*``
-    when ``part.tool`` is a non-empty string; otherwise the event is skipped.
-  * All other event types are ignored.
+  * :func:`_assemble_message` (the full trace) collects ``"text"`` and
+    ``"tool_use"`` events in stream order:
 
-  Non-empty segments are joined with ``"\\n\\n"`` and the result is
-  ``.strip()``-ped.  This ensures tool invocations between text bursts are
-  visible in the Linear comment rather than silently elided.
+    + ``"text"`` events contribute ``part.text`` (when non-empty).
+    + ``"tool_use"`` events contribute ``*<part.state.title>*`` when
+      ``part.state.title`` is a non-empty string; otherwise ``*<part.tool>*``
+      when ``part.tool`` is a non-empty string; otherwise the event is
+      skipped.
+    + All other event types are ignored.
+
+    Non-empty segments are joined with ``"\\n\\n"`` and the result is
+    ``.strip()``-ped.  This is the timeout diagnostic (the only trace of a
+    killed turn) and the fallback for the trimmed assembly.
+
+  * :func:`_assemble_final_reply` (the trimmed reply, success path only)
+    first drops events whose top-level ``sessionID`` differs from the main
+    session id, then keeps only the ``"text"`` segments that appear *after*
+    the last ``"tool_use"`` event — i.e. the assistant's closing reply.
+    If nothing survives (the turn ended on a tool call), it falls back to
+    the full assembly, so the worst case equals the full trace.
 
 - ``stderr`` is empty on success; on failure it contains diagnostic output
   that we include in ``OpenCodeError``.
@@ -659,8 +670,10 @@ def _execute(
         # ------------------------------------------------------------------
         # Assemble final message (after validation so malformed-but-parseable
         # output doesn't mask exit-code / signal / missing-session errors).
+        # A successful turn posts only the closing reply; the full trace stays
+        # available as the fallback (and for the timeout path above).
         # ------------------------------------------------------------------
-        final_message = _assemble_message(parsed_events)
+        final_message = _assemble_final_reply(parsed_events, session_id)
 
         return session_id, final_message, context_tokens
 
@@ -672,6 +685,62 @@ def _execute(
                 proc.wait(timeout=5)
             except Exception:
                 pass
+
+
+def _assemble_final_reply(events: list[dict], session_id: str) -> str:
+    """Assemble the trimmed final reply for a successful turn.
+
+    The full :func:`_assemble_message` trace makes tracker comments hard to
+    read — the reader must scroll past narration and tool titles to reach
+    the answer.  For a successful turn the comment is trimmed to the
+    assistant's closing reply:
+
+    * Events whose top-level ``sessionID`` is set and differs from
+      *session_id* (subagent chatter) are dropped.
+    * Only ``"text"`` segments that appear *after* the last ``"tool_use"``
+      event are kept — anything said between tool calls is dropped.
+
+    If nothing survives (the turn ended on a tool call, or there was no
+    text at all), fall back to :func:`_assemble_message` over the *full*
+    event list, so the worst case equals the pre-trimming behaviour.
+
+    Only the success path of :func:`_execute` uses this.  The timeout path
+    keeps the full trace: it is the only diagnostic on a killed turn.
+    """
+    # (a) Drop events whose top-level sessionID is set and differs from the
+    # main session id — this kills subagent chatter.
+    filtered: list[dict] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        sid = event.get("sessionID")
+        if sid and sid != session_id:
+            continue
+        filtered.append(event)
+
+    # (b) Find the last tool_use event so only text after it survives.
+    last_tool_use = -1
+    for i, event in enumerate(filtered):
+        if event.get("type") == "tool_use":
+            last_tool_use = i
+
+    segments: list[str] = []
+    for event in filtered[last_tool_use + 1 :]:
+        if event.get("type") != "text":
+            continue
+        part = event.get("part")
+        if not isinstance(part, dict):
+            part = {}
+        text = part.get("text")
+        if isinstance(text, str) and text:
+            segments.append(text)
+
+    trimmed = "\n\n".join(segments).strip()
+
+    # (c) Empty result (turn ended on a tool call) → full assembly fallback.
+    if trimmed:
+        return trimmed
+    return _assemble_message(events)
 
 
 def _assemble_message(events: list[dict]) -> str:

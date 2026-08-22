@@ -90,7 +90,9 @@ def _build_initial_prompt(title: str, description: str | None) -> str:
         "You're working on a Linear ticket. Anything you say will be posted as a "
         "comment on the ticket. The human will reply by commenting on the ticket, "
         "and their replies will be delivered to you as user messages. There's no "
-        "other way to talk to them.\n\n---\n\n"
+        "other way to talk to them. Only your last message is posted. Anything you "
+        "say between tool calls is dropped, so put the whole answer in your final "
+        "message — do not spread it across the turn.\n\n---\n\n"
         f"# {title}\n\n{desc}"
     )
 

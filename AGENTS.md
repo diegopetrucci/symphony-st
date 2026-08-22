@@ -122,8 +122,15 @@ shutting down, or the ticket is no longer triggered — see `_is_still_triggered
   *outside* the sandbox using the daemon's credentials; OpenCode and
   `.symphony/setup` run *inside*.
 - **The OpenCode session id is captured from the first NDJSON event** that
-  includes `sessionID`. The final assistant message is the concatenation of
-  all `"text"` events. Other event types are intentionally ignored.
+  includes `sessionID`; that value is the main session and any event whose
+  top-level `sessionID` differs is subagent chatter. The final assistant
+  message is assembled differently per path: a *successful* turn is trimmed
+  to the closing reply (`_assemble_final_reply`: subagent-session events are
+  dropped, only `"text"` segments after the last `tool_use` event are kept,
+  and an empty result falls back to the full assembly), while the *timeout*
+  path keeps the full `_assemble_message` trace — every `"text"` segment
+  plus one `*tool title*` line per tool call — because it is the only
+  diagnostic on a killed turn. Other event types are intentionally ignored.
 - **`OPENCODE_PERMISSION` is injected into the sandbox env for every turn** to
   pre-answer the three permissions that default to `ask` (external_directory,
   doom_loop, read); do not delete it as redundant with
