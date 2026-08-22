@@ -79,6 +79,8 @@ linear:
 # value is looked up case-insensitively here; a value that is not in the
 # map is used verbatim, so a raw provider/model id (e.g.
 # `Model: anthropic/claude-sonnet-4-6`) works with no config change.
+# Every value below must be a full `provider/model` id — the daemon
+# refuses to start otherwise.
 # Remove the label and the agent's own model applies again.  Subagents
 # keep their own models.  On Linear, one label per alias is created at
 # startup; on GitHub, labels are per-repository, so create them yourself.

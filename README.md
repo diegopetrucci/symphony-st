@@ -373,6 +373,10 @@ models:
   Cheap: openai/gpt-5-mini
 ```
 
+Each entry must be a full `provider/model` id. A bare model name is
+rejected at startup, since OpenCode reads everything before the first `/`
+as the provider.
+
 A value that is not in the map is used verbatim, so a raw provider/model id
 works with no config change:
 

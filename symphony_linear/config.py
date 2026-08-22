@@ -217,6 +217,25 @@ class AppConfig(BaseModel):
         ),
     )
 
+    @field_validator("models")
+    @classmethod
+    def _validate_model_ids(cls, v: dict[str, str]) -> dict[str, str]:
+        """Model alias values must be full '<provider>/<model>' ids.
+
+        Only the shape is checked here — whether the provider or model
+        actually exists is something only OpenCode can answer, and label
+        values that are not aliases never pass through this field.
+        """
+        for alias, value in v.items():
+            provider, sep, model = value.partition("/")
+            if not sep or not provider or not model:
+                raise ValueError(
+                    f"Invalid models entry for alias {alias!r}: {value!r}. "
+                    f"Expected a full provider/model id like "
+                    f"'anthropic/claude-opus-5'."
+                )
+        return v
+
     @model_validator(mode="before")
     @classmethod
     def _drop_null_subconfigs(cls, data: Any) -> Any:

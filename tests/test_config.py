@@ -305,6 +305,67 @@ class TestLoadConfig:
 
 
 # ---------------------------------------------------------------------------
+# models: alias map validation
+# ---------------------------------------------------------------------------
+
+
+class TestModelMapValidation:
+    def _config_with_models(self, models: dict[str, str]) -> dict[str, object]:
+        return {
+            "linear": {
+                "api_key": "test-key",
+            },
+            "models": models,
+        }
+
+    def test_well_formed_models_pass(self, tmp_path: Path) -> None:
+        cfg = self._config_with_models(
+            {
+                "Strong": "anthropic/claude-opus-5",
+                "Cheap": "openai/gpt-5-mini",
+            }
+        )
+        _write_yaml(tmp_path / "config.yaml", cfg)
+
+        config = load_config(tmp_path)
+        assert config.models == {
+            "Strong": "anthropic/claude-opus-5",
+            "Cheap": "openai/gpt-5-mini",
+        }
+
+    def test_empty_models_map_passes(self, tmp_path: Path) -> None:
+        cfg = self._config_with_models({})
+        _write_yaml(tmp_path / "config.yaml", cfg)
+
+        config = load_config(tmp_path)
+        assert config.models == {}
+
+    def test_slashless_value_rejected_and_names_alias(self, tmp_path: Path) -> None:
+        cfg = self._config_with_models({"Strong": "claude-fable-5"})
+        _write_yaml(tmp_path / "config.yaml", cfg)
+
+        with pytest.raises(ValueError, match="Strong") as excinfo:
+            load_config(tmp_path)
+        # The offending value and the expected form are part of the message.
+        assert "claude-fable-5" in str(excinfo.value)
+        assert "provider/model" in str(excinfo.value)
+
+    def test_empty_provider_half_rejected(self, tmp_path: Path) -> None:
+        cfg = self._config_with_models({"Strong": "/claude-opus-5"})
+        _write_yaml(tmp_path / "config.yaml", cfg)
+
+        with pytest.raises(ValueError, match="Strong"):
+            load_config(tmp_path)
+
+    def test_empty_model_half_rejected(self, tmp_path: Path) -> None:
+        cfg = self._config_with_models({"Strong": "anthropic/"})
+        _write_yaml(tmp_path / "config.yaml", cfg)
+
+        with pytest.raises(ValueError, match="Strong"):
+            load_config(tmp_path)
+
+
+# ---------------------------------------------------------------------------
 # GitHub backend config tests
 # ---------------------------------------------------------------------------
 
