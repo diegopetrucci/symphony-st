@@ -239,6 +239,7 @@ def run_initial(
     hide_paths: list[str] | None = None,
     extra_rw_paths: list[str] | None = None,
     attachments_path: str | None = None,
+    dir_map: list[tuple[str, str]] | None = None,
     tmp_path: str,
     files: list[str] | None = None,
     model: str | None = None,
@@ -266,6 +267,8 @@ def run_initial(
             sandbox.  Defaults to empty list.
         attachments_path: Optional host path to a per-ticket attachments
             directory.  Passed through to the sandbox.
+        dir_map: Pre-resolved ``(host_source, sandbox_dest)`` bind pairs from
+            ``workspace.ensure_dir_map``.  Passed through to the sandbox.
         tmp_path: Host path to the per-ticket tmp directory, mounted at
             ``/tmp`` inside the sandbox.  Must exist on the host (bwrap
             ``--bind`` is fatal otherwise).
@@ -313,6 +316,7 @@ def run_initial(
         hide_paths=hide_paths or [],
         extra_rw_paths=extra_rw_paths or [],
         attachments_path=attachments_path,
+        dir_map=dir_map,
         tmp_path=tmp_path,
     )
 
@@ -328,6 +332,7 @@ def run_resume(
     hide_paths: list[str] | None = None,
     extra_rw_paths: list[str] | None = None,
     attachments_path: str | None = None,
+    dir_map: list[tuple[str, str]] | None = None,
     tmp_path: str,
     files: list[str] | None = None,
     model: str | None = None,
@@ -357,6 +362,8 @@ def run_resume(
             sandbox.  Defaults to empty list.
         attachments_path: Optional host path to a per-ticket attachments
             directory.  Passed through to the sandbox.
+        dir_map: Pre-resolved ``(host_source, sandbox_dest)`` bind pairs from
+            ``workspace.ensure_dir_map``.  Passed through to the sandbox.
         tmp_path: Host path to the per-ticket tmp directory, mounted at
             ``/tmp`` inside the sandbox.  Must exist on the host (bwrap
             ``--bind`` is fatal otherwise).
@@ -412,6 +419,7 @@ def run_resume(
         hide_paths=hide_paths or [],
         extra_rw_paths=extra_rw_paths or [],
         attachments_path=attachments_path,
+        dir_map=dir_map,
         tmp_path=tmp_path,
     )
     return final_message, context_tokens
@@ -478,6 +486,7 @@ def _execute(
     hide_paths: list[str] | None = None,
     extra_rw_paths: list[str] | None = None,
     attachments_path: str | None = None,
+    dir_map: list[tuple[str, str]] | None = None,
 ) -> tuple[str, str, int | None]:
     """Launch *cmd* inside the sandbox and parse the JSON event stream.
 
@@ -503,6 +512,7 @@ def _execute(
         stderr=subprocess.PIPE,
         extra_rw_paths=extra_rw_paths or [],
         attachments_path=attachments_path,
+        dir_map=dir_map,
     )
 
     # Let the caller register the Popen handle immediately.

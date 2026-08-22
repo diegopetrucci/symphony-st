@@ -276,6 +276,84 @@ class TestLoadConfig:
             "/opt/tools",
         ]
 
+    def test_default_dir_map(self, tmp_path: Path) -> None:
+        """dir_map defaults to an empty dict."""
+        cfg = {
+            "linear": {
+                "api_key": "test-key",
+            },
+        }
+        _write_yaml(tmp_path / "config.yaml", cfg)
+
+        config = load_config(tmp_path)
+        assert config.sandbox.dir_map == {}
+
+    def test_dir_map_keys_tilde_expanded(self, tmp_path: Path) -> None:
+        """dir_map keys get ~ expansion (values are expanded by the loader)."""
+        cfg = {
+            "linear": {
+                "api_key": "key",
+            },
+            "sandbox": {
+                "dir_map": {
+                    "~/.config/npm": "npm",
+                    "~/.npm": "~/sandboxes/caches/.npm",
+                },
+            },
+        }
+        _write_yaml(tmp_path / "config.yaml", cfg)
+
+        config = load_config(tmp_path)
+        assert config.sandbox.dir_map == {
+            str(Path.home() / ".config" / "npm"): "npm",
+            str(Path.home() / ".npm"): str(Path.home() / "sandboxes/caches/.npm"),
+        }
+
+    def test_dir_map_relative_key_rejected(self, tmp_path: Path) -> None:
+        """A dir_map key that is not absolute after ~ expansion is rejected."""
+        cfg = {
+            "linear": {
+                "api_key": "key",
+            },
+            "sandbox": {
+                "dir_map": {"npm": "npm"},
+            },
+        }
+        _write_yaml(tmp_path / "config.yaml", cfg)
+
+        with pytest.raises(ValueError, match="dir_map key"):
+            load_config(tmp_path)
+
+    def test_dir_map_empty_value_rejected(self, tmp_path: Path) -> None:
+        """Empty dir_map values are rejected."""
+        cfg = {
+            "linear": {
+                "api_key": "key",
+            },
+            "sandbox": {
+                "dir_map": {"~/.config/npm": ""},
+            },
+        }
+        _write_yaml(tmp_path / "config.yaml", cfg)
+
+        with pytest.raises(ValueError, match="non-empty"):
+            load_config(tmp_path)
+
+    def test_dir_map_value_with_dotdot_rejected(self, tmp_path: Path) -> None:
+        """dir_map values containing '..' are rejected."""
+        cfg = {
+            "linear": {
+                "api_key": "key",
+            },
+            "sandbox": {
+                "dir_map": {"~/.config/npm": "../escape"},
+            },
+        }
+        _write_yaml(tmp_path / "config.yaml", cfg)
+
+        with pytest.raises(ValueError, match="'..'"):
+            load_config(tmp_path)
+
     def test_qa_state_defaults_to_none(self, tmp_path: Path) -> None:
         """qa_state is optional and defaults to None."""
         cfg = {

@@ -118,7 +118,15 @@ shutting down, or the ticket is no longer triggered — see `_is_still_triggered
   unshares user/pid/ipc/uts. Credential dirs (`~/.ssh`, etc.) are hidden via
   `--tmpfs` (dirs) or `--ro-bind /dev/null` (files/sockets). The per-ticket
   `tmp/` dir is bind-mounted read-write at `/tmp` inside the sandbox —
-  it is per-ticket, disk-backed, and deleted with the ticket dir. Git ops run
+  it is per-ticket, disk-backed, and deleted with the ticket dir.
+  `sandbox.dir_map` (sandbox path → host source) adds `--bind` mounts AFTER
+  the hide block so an explicit mapping punches through a broad hide:
+  relative sources live under the per-ticket `mounts/` dir (deleted with the
+  ticket), absolute sources are shared host dirs that survive cleanup and are
+  writable by up to 5 concurrent workers. Resolution, containment, and
+  `mkdir -p` of both sides happen in `workspace.ensure_dir_map` (bwrap cannot
+  create mount points under the read-only root bind); `run_in_sandbox` only
+  emits argv from the resolved pairs. Git ops run
   *outside* the sandbox using the daemon's credentials; OpenCode and
   `.symphony/setup` run *inside*.
 - **The OpenCode session id is captured from the first NDJSON event** that

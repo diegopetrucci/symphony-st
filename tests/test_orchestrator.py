@@ -4894,6 +4894,180 @@ class TestExtraRWPaths:
 
 
 # ---------------------------------------------------------------------------
+# Dir map (mirrors ExtraRWPaths: resolved pairs reach every sandbox entry point)
+# ---------------------------------------------------------------------------
+
+
+class TestDirMapPlumbing:
+    """sandbox.dir_map is resolved once per pipeline via ensure_dir_map and the
+    resulting (host_source, sandbox_dest) pairs reach setup, serve, the initial
+    turn, and resume turns."""
+
+    PAIRS: list[tuple[str, str]] = [("/host/src/npm", "/sandbox/dest/npm")]
+
+    def _make_orchestrator(
+        self,
+        tmp_path: Path,
+        state_mgr: StateManager,
+        linear: FakeLinearClient,
+        *,
+        qa: bool = False,
+    ) -> Orchestrator:
+        overrides: dict[str, Any] = {"sandbox": {"dir_map": {"~/fake/dest": "npm"}}}
+        if qa:
+            overrides["linear"] = {"qa_state": "In Review"}
+        config = _make_config(tmp_path, **overrides)
+        return Orchestrator(
+            config=config,
+            state=state_mgr,
+            tracker=LinearTracker(linear=linear, config=config.linear),  # type: ignore[arg-type]
+            workspace=tmp_path / "ws",
+        )
+
+    def test_dir_map_passed_to_finalize(
+        self, tmp_path: Path, state_mgr: StateManager, linear: FakeLinearClient
+    ) -> None:
+        """finalize_workspace receives the resolved dir_map pairs."""
+        orch = self._make_orchestrator(tmp_path, state_mgr, linear)
+        linear.set_response(
+            "get_project",
+            Project(
+                id="proj-1",
+                name="Test",
+                links=[
+                    ProjectLink(label="Repo", url="https://github.com/org/repo.git")
+                ],
+            ),
+        )
+        linear.set_response("get_issue", _make_issue(description="Fix"))
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.clone_workspace",
+                return_value=("/tmp/ws/TEAM-1", False),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.ensure_dir_map",
+                return_value=self.PAIRS,
+            ) as m_ensure,
+            mock.patch(
+                "symphony_linear.orchestrator.finalize_workspace",
+            ) as m_finalize,
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config",
+                return_value=ProjectConfig(),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.run_initial",
+                return_value=("ses", "msg", None),
+            ),
+        ):
+            orch._new_ticket_pipeline(_make_issue())
+        _, kwargs = m_finalize.call_args
+        assert kwargs.get("sandbox_dir_map") == self.PAIRS
+        assert m_ensure.call_args.args[0] == orch._config.sandbox.dir_map
+
+    def test_dir_map_passed_to_run_initial(
+        self, tmp_path: Path, state_mgr: StateManager, linear: FakeLinearClient
+    ) -> None:
+        linear.set_response(
+            "get_project",
+            Project(
+                id="proj-1",
+                name="Test",
+                links=[
+                    ProjectLink(label="Repo", url="https://github.com/org/repo.git")
+                ],
+            ),
+        )
+        linear.set_response("get_issue", _make_issue(description="Fix"))
+        orch = self._make_orchestrator(tmp_path, state_mgr, linear)
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.clone_workspace",
+                return_value=("/tmp/ws/TEAM-1", False),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.ensure_dir_map",
+                return_value=self.PAIRS,
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.finalize_workspace",
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config",
+                return_value=ProjectConfig(),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.run_initial",
+                return_value=("ses", "msg", None),
+            ) as m_oc,
+        ):
+            orch._new_ticket_pipeline(_make_issue())
+        _, kwargs = m_oc.call_args
+        assert kwargs.get("dir_map") == self.PAIRS
+
+    def test_dir_map_passed_to_run_resume(
+        self, tmp_path: Path, state_mgr: StateManager, linear: FakeLinearClient
+    ) -> None:
+        orch = self._make_orchestrator(tmp_path, state_mgr, linear)
+        ts = TicketState(
+            ticket_id="ticket-1",
+            ticket_identifier="TEAM-1",
+            repo_url="https://x",
+            workspace_path="/tmp/x",
+            branch="main",
+            status=TicketStatus.needs_input,
+            session_id="ses-abc",
+            last_seen_comment_id="cmt-seen-1",
+        )
+        orch._state.upsert(ts)
+        linear.set_response("list_comments_since", [_make_comment("c1", "Go")])
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config",
+                return_value=ProjectConfig(),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.ensure_dir_map",
+                return_value=self.PAIRS,
+            ) as m_ensure,
+            mock.patch(
+                "symphony_linear.orchestrator.run_resume", return_value=("Done!", None)
+            ) as m_oc,
+        ):
+            orch._resume_pipeline(ts)
+        _, kwargs = m_oc.call_args
+        assert kwargs.get("dir_map") == self.PAIRS
+        assert m_ensure.call_args.args[0] == orch._config.sandbox.dir_map
+
+    def test_dir_map_passed_to_start_serve(
+        self, tmp_path: Path, state_mgr: StateManager, linear: FakeLinearClient
+    ) -> None:
+        orch = self._make_orchestrator(tmp_path, state_mgr, linear, qa=True)
+        _add_ticket_state(orch)
+
+        issue = _make_qa_issue()
+        fake_proc = _make_fake_proc(returncode=None)
+
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.ensure_dir_map",
+                return_value=self.PAIRS,
+            ) as m_ensure,
+            mock.patch(
+                "symphony_linear.orchestrator.start_serve",
+                return_value=fake_proc,
+            ) as m_serve,
+        ):
+            orch._reconcile_serve([issue], {issue.id: issue})
+
+        m_serve.assert_called_once()
+        _, kwargs = m_serve.call_args
+        assert kwargs.get("dir_map") == self.PAIRS
+        assert m_ensure.call_args.args[0] == orch._config.sandbox.dir_map
+
+
+# ---------------------------------------------------------------------------
 # Subprocess management
 # ---------------------------------------------------------------------------
 

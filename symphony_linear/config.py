@@ -152,6 +152,49 @@ class _SandboxConfig(BaseModel):
         default_factory=list,
         description="Additional host paths to bind read-write inside the sandbox",
     )
+    dir_map: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Map of sandbox-internal paths (keys) to host source directories "
+            "(values). Relative values resolve under each ticket's mounts/ "
+            "directory; absolute values are shared host directories."
+        ),
+    )
+
+    @field_validator("dir_map", mode="before")
+    @classmethod
+    def _expand_dir_map_keys(cls, v: Any) -> Any:
+        # _expand_values walks values only, so expand ~ in keys explicitly.
+        # Values are already expanded by the loader.
+        if not isinstance(v, dict):
+            return v
+        expanded: dict[str, str] = {}
+        for key, val in v.items():
+            if (
+                isinstance(key, str)
+                and key.startswith("~")
+                and (len(key) == 1 or key[1] in ("/", os.sep))
+            ):
+                key = str(Path(key).expanduser())
+            expanded[key] = val
+        return expanded
+
+    @field_validator("dir_map")
+    @classmethod
+    def _validate_dir_map(cls, v: dict[str, str]) -> dict[str, str]:
+        for dest, source in v.items():
+            if not isinstance(dest, str) or not os.path.isabs(dest):
+                raise ValueError(
+                    f"dir_map key {dest!r} must be an absolute path inside "
+                    f"the sandbox (after ~ expansion)"
+                )
+            if not isinstance(source, str) or not source:
+                raise ValueError(
+                    f"dir_map value for {dest!r} must be a non-empty string"
+                )
+            if ".." in Path(source).parts:
+                raise ValueError(f"dir_map value for {dest!r} must not contain '..'")
+        return v
 
 
 class _WebhookConfig(BaseModel):

@@ -48,6 +48,7 @@ from symphony_linear.workspace import (
     compute_workspace_path,
     dirty_summary,
     ensure_attachments_dir,
+    ensure_dir_map,
     ensure_tmp_dir,
     finalize_workspace,
     remove,
@@ -891,10 +892,14 @@ class Orchestrator:
             # per-ticket tmp directory exists before launching the sandbox
             # (bwrap --bind is fatal when the source dir is missing).
             tmp_path = ensure_tmp_dir(winner.identifier, str(self._workspace))
+            dir_map = ensure_dir_map(
+                self._config.sandbox.dir_map, winner.identifier, str(self._workspace)
+            )
             proc = start_serve(
                 workspace_path=workspace_path,
                 hide_paths=self._config.sandbox.hide_paths,
                 extra_rw_paths=self._config.sandbox.extra_rw_paths,
+                dir_map=dir_map,
                 tmp_path=tmp_path,
             )
         except (ServeScriptMissing, WorkspaceError, FileNotFoundError) as exc:
@@ -1305,6 +1310,9 @@ class Orchestrator:
             # script runs inside the sandbox (bwrap --bind is fatal when the
             # source dir is missing).
             tmp_path = ensure_tmp_dir(issue.identifier, str(self._workspace))
+            dir_map = ensure_dir_map(
+                self._config.sandbox.dir_map, issue.identifier, str(self._workspace)
+            )
             finalize_workspace(
                 workspace_path=workspace_path,
                 ticket_identifier=issue.identifier,
@@ -1314,6 +1322,7 @@ class Orchestrator:
                     1
                 ],
                 sandbox_extra_rw_paths=self._config.sandbox.extra_rw_paths,
+                sandbox_dir_map=dir_map,
                 auto_branch=effective_auto_branch,
                 tmp_path=tmp_path,
             )
@@ -1426,6 +1435,11 @@ class Orchestrator:
         host_attachments_dir = ensure_attachments_dir(
             ticket_state.ticket_identifier, str(self._workspace)
         )
+        dir_map = ensure_dir_map(
+            self._config.sandbox.dir_map,
+            ticket_state.ticket_identifier,
+            str(self._workspace),
+        )
         try:
             result = process_attachments(
                 description or "",
@@ -1504,6 +1518,7 @@ class Orchestrator:
                 hide_paths=self._config.sandbox.hide_paths,
                 extra_rw_paths=self._config.sandbox.extra_rw_paths,
                 attachments_path=host_attachments_dir,
+                dir_map=dir_map,
                 tmp_path=tmp_path,
                 files=files,
                 model=model,
@@ -1679,6 +1694,11 @@ class Orchestrator:
         # runs inside the sandbox (bwrap --bind is fatal when the source dir
         # is missing).
         tmp_path = ensure_tmp_dir(ticket_state.ticket_identifier, str(self._workspace))
+        dir_map = ensure_dir_map(
+            self._config.sandbox.dir_map,
+            ticket_state.ticket_identifier,
+            str(self._workspace),
+        )
         try:
             result = process_attachments(
                 message,
@@ -1790,6 +1810,7 @@ class Orchestrator:
                 hide_paths=self._config.sandbox.hide_paths,  # B3
                 extra_rw_paths=self._config.sandbox.extra_rw_paths,
                 attachments_path=host_attachments_dir,
+                dir_map=dir_map,
                 tmp_path=tmp_path,
                 files=files_attach,
                 model=model,

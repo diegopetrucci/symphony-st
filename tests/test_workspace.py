@@ -12,18 +12,21 @@ import shutil
 import stat
 import subprocess
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
 from symphony_linear.workspace import (
     BranchFailed,
     CloneFailed,
+    DirMapError,
     PathContainmentError,
     ServeScriptMissing,
     SetupFailed,
     WorkspaceError,
     _ATTACHMENTS_DIR,
     _check_containment,
+    _MOUNTS_DIR,
     _REPO_DIR,
     _sanitize_identifier,
     _TMP_DIR,
@@ -33,10 +36,12 @@ from symphony_linear.workspace import (
     compute_tmp_path,
     dirty_summary,
     ensure_attachments_dir,
+    ensure_dir_map,
     ensure_tmp_dir,
     finalize_workspace,
     prepare,
     remove,
+    resolve_dir_map,
     start_serve,
 )
 
@@ -278,6 +283,114 @@ class TestEnsureTmpDir:
         second = ensure_tmp_dir("T-42", str(root))
         assert first == second
         assert os.path.isdir(first)
+
+
+# ---------------------------------------------------------------------------
+# Unit: sandbox.dir_map resolution and preparation
+# ---------------------------------------------------------------------------
+
+
+class TestResolveDirMap:
+    """resolve_dir_map: relative vs absolute values, containment, '..'."""
+
+    def test_relative_value_resolves_under_ticket_mounts_dir(
+        self, tmp_path: Path
+    ) -> None:
+        pairs = resolve_dir_map({"~/dest": "npm"}, "TEAM-1", str(tmp_path))
+        assert pairs == [
+            (os.path.join(str(tmp_path), "TEAM-1", _MOUNTS_DIR, "npm"), "~/dest")
+        ]
+
+    def test_absolute_value_used_verbatim(self, tmp_path: Path) -> None:
+        pairs = resolve_dir_map(
+            {"/sandbox/npm": "/host/shared-cache"}, "TEAM-1", str(tmp_path)
+        )
+        assert pairs == [("/host/shared-cache", "/sandbox/npm")]
+
+    def test_empty_dir_map_resolves_to_nothing(self, tmp_path: Path) -> None:
+        assert resolve_dir_map({}, "TEAM-1", str(tmp_path)) == []
+
+    def test_relative_value_with_dotdot_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(PathContainmentError, match=r"\.\."):
+            resolve_dir_map({"~/dest": "../escape"}, "TEAM-1", str(tmp_path))
+
+    def test_relative_value_symlink_escape_rejected(self, tmp_path: Path) -> None:
+        """A mounts/ symlink pointing outside must fail containment."""
+        root = tmp_path / "ws"
+        root.mkdir()
+        ticket_dir = root / "TEAM-1"
+        ticket_dir.mkdir()
+        # Escape target lives outside the workspace root.
+        escape_target = tmp_path / "outside"
+        escape_target.mkdir()
+        (ticket_dir / _MOUNTS_DIR).symlink_to(escape_target)
+
+        with pytest.raises(PathContainmentError):
+            resolve_dir_map({"~/dest": "npm"}, "TEAM-1", str(root))
+
+
+class TestEnsureDirMap:
+    """ensure_dir_map: creates both sides on the host, dest-is-a-file error."""
+
+    def test_creates_host_source_and_dest(self, tmp_path: Path) -> None:
+        dest = tmp_path / "dest-npm"
+        pairs = ensure_dir_map({str(dest): "npm"}, "TEAM-1", str(tmp_path))
+
+        host_src = tmp_path / "TEAM-1" / _MOUNTS_DIR / "npm"
+        assert pairs == [(str(host_src), str(dest))]
+        assert host_src.is_dir()
+        assert dest.is_dir()
+        # Both sides are created with mode 0700.
+        assert (os.stat(host_src).st_mode & 0o777) == 0o700
+        assert (os.stat(dest).st_mode & 0o777) == 0o700
+
+    def test_absolute_source_created(self, tmp_path: Path) -> None:
+        shared = tmp_path / "shared-cache"
+        dest = tmp_path / "dest-npm"
+        pairs = ensure_dir_map({str(dest): str(shared)}, "TEAM-1", str(tmp_path))
+
+        assert pairs == [(str(shared), str(dest))]
+        assert shared.is_dir()
+        assert dest.is_dir()
+
+    def test_dest_existing_file_raises(self, tmp_path: Path) -> None:
+        dest_file = tmp_path / "dest-npm"
+        dest_file.write_text("i am a file")
+
+        with pytest.raises(DirMapError, match="not a directory"):
+            ensure_dir_map({str(dest_file): "npm"}, "TEAM-1", str(tmp_path))
+
+    def test_dest_dangling_symlink_raises(self, tmp_path: Path) -> None:
+        """A dangling symlink at the destination is caught (not passed to bwrap)."""
+        dest_link = tmp_path / "dest-link"
+        dest_link.symlink_to(tmp_path / "nonexistent-target")
+
+        with pytest.raises(DirMapError, match="not a directory"):
+            ensure_dir_map({str(dest_link): "npm"}, "TEAM-1", str(tmp_path))
+
+    def test_source_existing_file_raises(self, tmp_path: Path) -> None:
+        src_file = tmp_path / "TEAM-1" / _MOUNTS_DIR / "npm"
+        src_file.parent.mkdir(parents=True)
+        src_file.write_text("i am a file")
+
+        with pytest.raises(DirMapError, match=r"dir_map source"):
+            ensure_dir_map({str(tmp_path / "dest-npm"): "npm"}, "TEAM-1", str(tmp_path))
+
+    def test_mkdir_permission_failure_wrapped(self, tmp_path: Path) -> None:
+        """An OSError during preparation surfaces as DirMapError, not raw OSError."""
+        with mock.patch(
+            "symphony_linear.workspace.os.makedirs",
+            side_effect=PermissionError("permission denied"),
+        ):
+            with pytest.raises(DirMapError, match="could not be created"):
+                ensure_dir_map(
+                    {str(tmp_path / "dest-npm"): "npm"}, "TEAM-1", str(tmp_path)
+                )
+
+    def test_empty_dir_map_creates_nothing(self, tmp_path: Path) -> None:
+        assert ensure_dir_map({}, "TEAM-1", str(tmp_path)) == []
+        # No mounts/ dir (and no ticket dir at all) for an empty map.
+        assert not (tmp_path / "TEAM-1").exists()
 
 
 # ---------------------------------------------------------------------------

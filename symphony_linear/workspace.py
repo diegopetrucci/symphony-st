@@ -36,6 +36,8 @@ _DEFAULT_BRANCH_PREFIX = "symphony/"
 _REPO_DIR = "repo"
 _ATTACHMENTS_DIR = "attachments"
 _TMP_DIR = "tmp"
+# Host-side source root for relative sandbox.dir_map entries.
+_MOUNTS_DIR = "mounts"
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +63,10 @@ class SetupFailed(WorkspaceError):
 
 class PathContainmentError(WorkspaceError):
     """Computed workspace path escapes the workspace root (security invariant)."""
+
+
+class DirMapError(WorkspaceError):
+    """A sandbox ``dir_map`` entry could not be prepared for mounting."""
 
 
 class ServeScriptMissing(WorkspaceError):
@@ -157,6 +163,99 @@ def ensure_tmp_dir(ticket_identifier: str, workspace_root: str) -> str:
     return tmp_dir
 
 
+def resolve_dir_map(
+    dir_map: dict[str, str],
+    ticket_identifier: str,
+    workspace_root: str,
+) -> list[tuple[str, str]]:
+    """Resolve ``sandbox.dir_map`` entries to ``(host_source, sandbox_dest)`` pairs.
+
+    Values are classified by :func:`os.path.isabs` after config expansion:
+
+    * Relative values resolve under ``<ticket_dir>/mounts/`` (a sibling of
+      ``repo/``, ``tmp/``, ``attachments/``, deleted with the ticket).  ``..``
+      components are rejected and the result must pass containment.
+    * Absolute values are used as-is — no containment check, same trust level
+      as ``extra_rw_paths``.  They survive ticket cleanup; that is the point.
+
+    This function does **not** create anything.
+
+    Raises:
+        PathContainmentError: A relative value contains ``..`` or its resolved
+            path escapes *workspace_root*.
+    """
+    if not dir_map:
+        return []
+    pairs: list[tuple[str, str]] = []
+    for dest, source in dir_map.items():
+        if os.path.isabs(source):
+            pairs.append((source, dest))
+            continue
+        if ".." in Path(source).parts:
+            raise PathContainmentError(
+                f"dir_map relative source {source!r} must not contain '..'"
+            )
+        host_source = os.path.join(
+            compute_ticket_dir(ticket_identifier, workspace_root),
+            _MOUNTS_DIR,
+            source,
+        )
+        _check_containment(host_source, workspace_root)
+        pairs.append((host_source, dest))
+    return pairs
+
+
+def ensure_dir_map(
+    dir_map: dict[str, str],
+    ticket_identifier: str,
+    workspace_root: str,
+) -> list[tuple[str, str]]:
+    """Resolve *dir_map* and create both sides on the host, ready for bwrap.
+
+    Returns ``(host_source, sandbox_dest)`` pairs for
+    :func:`~symphony_linear.sandbox.run_in_sandbox`.  Both the host source and
+    the sandbox destination are created with ``mkdir -p`` (mode 0700) — bwrap
+    cannot create a mount point under the read-only root bind, so the
+    destination must already exist on the host.  Only the leaf directories
+    actually needed are created; an empty *dir_map* creates nothing (in
+    particular, no empty ``mounts/`` directory).
+
+    Raises:
+        PathContainmentError: A relative value contains ``..`` or its resolved
+            path escapes *workspace_root*.
+        DirMapError: A source or destination exists on the host and is not a
+            directory (a dangling symlink destination is caught too), or
+            either side could not be created.
+    """
+    pairs = resolve_dir_map(dir_map, ticket_identifier, workspace_root)
+    for host_source, dest in pairs:
+        # lexists (not exists) so a dangling symlink at the destination is
+        # caught here instead of failing obscurely inside bwrap.
+        if os.path.lexists(dest) and not os.path.isdir(dest):
+            raise DirMapError(
+                f"dir_map destination {dest!r} exists on the host and is not "
+                f"a directory — cannot bind a directory over it"
+            )
+        if os.path.exists(host_source) and not os.path.isdir(host_source):
+            raise DirMapError(
+                f"dir_map source {host_source!r} exists on the host and is not "
+                f"a directory — cannot bind from it"
+            )
+        try:
+            os.makedirs(host_source, mode=0o700, exist_ok=True)
+        except OSError as exc:
+            raise DirMapError(
+                f"dir_map source {host_source!r} could not be created: {exc}"
+            ) from exc
+        try:
+            os.makedirs(dest, mode=0o700, exist_ok=True)
+        except OSError as exc:
+            raise DirMapError(
+                f"dir_map destination {dest!r} could not be created: {exc}"
+            ) from exc
+    return pairs
+
+
 def _check_containment(workspace_path: str, workspace_root: str) -> str:
     """Verify *workspace_path* resides within *workspace_root* after symlink
     resolution.
@@ -227,6 +326,7 @@ def _run_setup_script(
     hide_paths: list[str],
     on_subprocess: Callable[[subprocess.Popen[bytes]], None] | None = None,
     extra_rw_paths: list[str] | None = None,
+    dir_map: list[tuple[str, str]] | None = None,
     *,
     tmp_path: str,
 ) -> None:
@@ -239,6 +339,8 @@ def _run_setup_script(
             immediately after launch, for external cancellation.
         extra_rw_paths: Additional host paths to bind read-write inside the
             sandbox.
+        dir_map: Pre-resolved ``(host_source, sandbox_dest)`` bind pairs from
+            :func:`ensure_dir_map`; both sides must exist on the host.
         tmp_path: Host path to the per-ticket tmp directory, mounted at
             ``/tmp`` inside the sandbox.  Must exist on the host (bwrap
             ``--bind`` is fatal otherwise).
@@ -264,6 +366,7 @@ def _run_setup_script(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         extra_rw_paths=extra_rw_paths or [],
+        dir_map=dir_map,
     )
 
     if on_subprocess is not None:
@@ -309,6 +412,7 @@ def start_serve(
     workspace_path: str,
     hide_paths: list[str],
     extra_rw_paths: list[str] | None = None,
+    dir_map: list[tuple[str, str]] | None = None,
     *,
     tmp_path: str,
 ) -> subprocess.Popen[bytes]:
@@ -324,6 +428,8 @@ def start_serve(
         hide_paths: Paths to conceal inside the sandbox.
         extra_rw_paths: Additional host paths to bind read-write inside the
             sandbox.
+        dir_map: Pre-resolved ``(host_source, sandbox_dest)`` bind pairs from
+            :func:`ensure_dir_map`; both sides must exist on the host.
         tmp_path: Host path to the per-ticket tmp directory, mounted at
             ``/tmp`` inside the sandbox.  Must exist on the host (bwrap
             ``--bind`` is fatal otherwise).
@@ -356,6 +462,7 @@ def start_serve(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         extra_rw_paths=extra_rw_paths or [],
+        dir_map=dir_map,
     )
 
 
@@ -595,6 +702,7 @@ def finalize_workspace(
     sandbox_hide_paths: list[str],
     on_subprocess: Callable[[subprocess.Popen[bytes]], None] | None = None,
     sandbox_extra_rw_paths: list[str] | None = None,
+    sandbox_dir_map: list[tuple[str, str]] | None = None,
     auto_branch: bool = True,
     *,
     tmp_path: str,
@@ -623,6 +731,8 @@ def finalize_workspace(
             setup script (if any), for external cancellation.
         sandbox_extra_rw_paths: Additional host paths to bind read-write inside
             the sandbox when running the setup script.
+        sandbox_dir_map: Pre-resolved ``(host_source, sandbox_dest)`` bind
+            pairs from :func:`ensure_dir_map` for the setup script's sandbox.
         auto_branch: If true (default), switch to a per-ticket branch after
             clone/fetch. If false, skip the branch switch entirely and leave
             the workspace on the cloned default branch.
@@ -654,6 +764,7 @@ def finalize_workspace(
         sandbox_hide_paths,
         on_subprocess=on_subprocess,
         extra_rw_paths=sandbox_extra_rw_paths,
+        dir_map=sandbox_dir_map,
         tmp_path=tmp_path,
     )
 
@@ -666,6 +777,7 @@ def prepare(
     sandbox_hide_paths: list[str],
     on_subprocess: Callable[[subprocess.Popen[bytes]], None] | None = None,
     sandbox_extra_rw_paths: list[str] | None = None,
+    sandbox_dir_map: list[tuple[str, str]] | None = None,
     auto_branch: bool = True,
 ) -> str:
     """Prepare a workspace for *ticket_identifier*.
@@ -702,6 +814,7 @@ def prepare(
         sandbox_hide_paths=sandbox_hide_paths,
         on_subprocess=on_subprocess,
         sandbox_extra_rw_paths=sandbox_extra_rw_paths,
+        sandbox_dir_map=sandbox_dir_map,
         auto_branch=auto_branch,
         tmp_path=tmp_path,
     )

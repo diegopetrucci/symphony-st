@@ -35,6 +35,7 @@ def run_in_sandbox(
     stderr: int = subprocess.PIPE,
     extra_rw_paths: list[str] | None = None,
     attachments_path: str | None = None,
+    dir_map: list[tuple[str, str]] | None = None,
 ) -> subprocess.Popen[bytes]:
     """Run *cmd* inside a bwrap sandbox and return the :class:`~subprocess.Popen` handle.
 
@@ -76,6 +77,15 @@ def run_in_sandbox(
             directory.  When set, the directory is mounted read-only at
             ``/tmp/symphony-attachments`` inside the sandbox.
             ``~`` is expanded.
+        dir_map: Pre-resolved ``(host_source, sandbox_dest)`` bind pairs
+            (see ``workspace.ensure_dir_map``).  Each pair is emitted as
+            ``--bind <host_source> <sandbox_dest>`` **after** the
+            *hide_paths* block so an explicit mapping can punch through a
+            broad hide (later bwrap mounts win).  Both sides must already
+            exist on the host: ``--bind`` is fatal otherwise and bwrap
+            cannot create a mount point under the read-only root bind.
+            Unlike *extra_rw_paths*, no expansion is applied — the pairs
+            arrive fully resolved.
 
     Returns:
         A :class:`subprocess.Popen` instance for the bwrap process.  The
@@ -162,6 +172,15 @@ def run_in_sandbox(
             # and symlinks alike.
             bwrap_args.extend(["--ro-bind", "/dev/null", path])
         # else: path does not exist on the host → nothing to conceal.
+
+    # 6a. dir_map binds.  Applied AFTER hide_paths (the inverse of
+    #     extra_rw_paths) so an explicit mapping punches through a broad
+    #     hide — later bwrap mounts win.  This exposes exactly the
+    #     explicitly configured source at the mapped destination; for
+    #     absolute values that source may be shared host data.
+    if dir_map:
+        for host_source, sandbox_dest in dir_map:
+            bwrap_args.extend(["--bind", host_source, sandbox_dest])
 
     # 7. Neutralize /etc/ssh/ssh_config.d.  systemd ships a symlink here
     #    (e.g. 20-systemd-ssh-proxy.conf → /usr/lib/systemd/...) that, inside

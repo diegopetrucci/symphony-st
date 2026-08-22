@@ -342,6 +342,18 @@ sandbox:
   # extra_rw_paths:
   #   - ~/projects/shared-tools
 
+  # Optional. Map a path inside the sandbox to a host directory (key =
+  # sandbox path, value = host source). Relative values resolve under the
+  # ticket's mounts/ directory and are deleted with the ticket; absolute
+  # values are shared host directories that survive ticket cleanup. Both
+  # sides are created on the host. Binds apply after hide_paths, so an
+  # explicit mapping can punch through a broad hide.
+  # CAUTION: a shared absolute directory is used by up to 5 concurrent
+  # ticket workers — not every tool tolerates that.
+  # dir_map:
+  #   ~/.config/npm: npm
+  #   ~/.npm: ~/sandboxes/caches/.npm
+
 # Seconds between poll cycles (default: 30, minimum: 1).
 poll_interval_seconds: 30
 
