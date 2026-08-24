@@ -172,6 +172,53 @@ shutting down, or the ticket is no longer triggered — see `_is_still_triggered
   `status = working`), and recovery only fires for tickets that are still in
   the tick's trigger list and not cleanup-refused, so QA tickets,
   untriggered tickets, and dirty-workspace refusals are left alone.
+- **Mid-turn comments are explicitly discarded, not queued.** A human
+  comment posted while a turn is genuinely running (a task is in flight in
+  `_active_tasks`) is never consumed by that turn, so tick step 4 posts one
+  "I did not read this" notice; the following ticks stay silent. The
+  warning is read-only with respect to persisted state: it never touches
+  `last_seen_comment_id` or state.json, because that id is the anchor
+  `_rerun_interrupted_turn` replays from after a restart — a turn that
+  completes normally already advances it past the warned comment via its
+  end-of-turn write, so a mid-turn write is redundant, and in the sequence
+  resume-consumes-H1 / human-posts-H2 / daemon-restarts it would leave
+  recovery nothing to replay (parking the ticket with "reply to continue"
+  instead of replaying H1 and H2). The in-flight lookup
+  (`_is_task_in_flight`, same `_active_tasks` map and `_task_lock` that
+  `_schedule_task` dedups with) is the signal, not the `working` status: a
+  ticket stuck in `working` with no task in flight is an interrupted turn,
+  and `_rerun_interrupted_turn` must still receive the pending comments as
+  replay input — warning there would swallow them. The check sits after the
+  untriggered / cleanup-refused / in-QA guards, which never warn, and is
+  re-run after the warning's comment fetch: a turn that finishes while that
+  fetch blocks gets no notice (its final reply already went out). "Pending"
+  is measured from the per-turn `_turn_input_marker` (in-memory, guarded by
+  `_task_lock`; key present = the running turn's input is fixed), never from
+  `last_seen_comment_id` — no pipeline advances that marker until the turn
+  ends, so measuring from it would accuse the comment that *started* the
+  turn. Each pipeline writes the marker when it fixes its input
+  (`_new_ticket_pipeline` and the replay path take a fresh
+  baseline via `_baseline_comment_id`; the normal resume path reuses the
+  newest id of the comments it already fetched), and a warning advances the
+  marker past the comments it warned about, so each comment is warned at
+  most once per turn; `_task_wrapper` pops it with the task. Tracker errors
+  are swallowed: a failed comment fetch leaves the markers untouched and the
+  next tick retries, while a failed warning post still advances the turn
+  marker — a failing post must not cause per-tick spam. Presence-gating
+  is deliberate: while the key is absent (input not yet fixed), a pending
+  comment cannot be told apart from the triggering one, so the daemon stays
+  silent — better a silent discard in that window than a false accusation.
+  Timestamps were rejected because tracker server time versus daemon local
+  time makes a comment posted moments before the turn starts exactly the one
+  that misclassifies. The marker is in-memory by design: on restart the map
+  is empty, nothing warns, and recovery behaves exactly as it does today.
+  Accepted consequence of the read-only warning: on turn paths that return
+  without an end-of-turn `last_seen_comment_id` write (OpenCodeCancelled
+  and the `_is_cancelled` early returns), a warned comment stays pending
+  and a later turn may consume it, so the agent can end up reading a
+  comment it said it did not read. Those paths mean the ticket was moved to
+  QA or untriggered, the comment is the human's own instruction, and acting
+  on it late is harmless. Preserving restart recovery is worth more.
 - **No auto-retry on failure.** A failed ticket goes to `TicketStatus.failed`
   and only retries if the user comments (resume path) or if there's no
   session id yet (re-runs the initial pipeline). The internal status and the

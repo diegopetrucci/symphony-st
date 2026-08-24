@@ -663,8 +663,9 @@ session id.
   credentials, so the agent cannot push. Pushing is a deliberate human
   step.
 - **No mid-turn steering.** You cannot interrupt or redirect a turn while
-  it is running. Comments you post mid-turn are queued and delivered at the
-  start of the next one.
+  it is running. Comments you post mid-turn are not read: the daemon posts
+  a short notice saying so, and you can comment again once the turn
+  finishes.
 - **No auto-retry.** A failed turn moves the ticket to `failed` and stays
   there. Comment on the ticket to re-trigger.
 - **Single workspace per ticket.** A ticket's workspace is reused across

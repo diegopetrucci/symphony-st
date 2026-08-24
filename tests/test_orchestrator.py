@@ -5,6 +5,7 @@ from __future__ import annotations
 import subprocess
 import threading
 import time
+from concurrent.futures import Future
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -30,6 +31,7 @@ from symphony_linear.opencode import (
 from symphony_linear.orchestrator import (
     Orchestrator,
     _ActiveServe,
+    _IGNORED_COMMENT_BODY,
     _format_comments_message,
 )
 from symphony_linear.project_config import (
@@ -284,6 +286,31 @@ class TestNewTicketPipeline:
         _, kw = mock_finalize.call_args
         assert kw.get("on_subprocess") is not None
         assert kw.get("auto_branch") is True  # global default
+
+    def test_turn_input_marker_set_to_baseline(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """The initial pipeline fixes its input against the newest comment id
+        at that moment (the baseline), so mid-turn warnings never accuse
+        comments that predate or triggered the turn."""
+        linear.set_response(
+            "list_comments_since", [_make_comment("cmt-existing", "hello")]
+        )
+        with (
+            mock.patch("symphony_linear.orchestrator.clone_workspace") as mock_clone,
+            mock.patch(
+                "symphony_linear.orchestrator.finalize_workspace"
+            ) as mock_finalize,
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config"
+            ) as mock_load_config,
+            mock.patch("symphony_linear.orchestrator.run_initial") as mock_run_initial,
+        ):
+            issue = self._setup_mocks(
+                mock_clone, mock_finalize, mock_load_config, mock_run_initial, linear
+            )
+            orchestrator._new_ticket_pipeline(issue)
+        assert orchestrator._turn_input_marker.get("ticket-1") == "cmt-existing"
 
     def test_model_label_reaches_run_initial_and_footer(
         self, orchestrator: Orchestrator, linear: FakeLinearClient
@@ -2268,6 +2295,62 @@ class TestResumePipeline:
         assert len(final_bodies) == 1
         assert final_bodies[0] == "Done!\n\n*Symphony · context: 37,074 tokens*"
 
+    def test_resume_turn_does_not_warn_about_triggering_comment(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """A running resume turn never gets an 'ignored' notice for the comment
+        that triggered it, on any tick while it runs.
+
+        The turn-input marker is set to the triggering comment's id, so the
+        warning pass (since=marker) sees nothing pending; last_seen is also
+        untouched mid-turn, keeping restart recovery able to replay.
+        """
+        ts = self._make_ts()
+        orchestrator._state.upsert(ts)
+        trig = _make_comment("cmt-trigger", "please fix")
+        # Emulate the tracker's positional semantics: the comment is only
+        # returned while the since point sits before it.
+        linear.list_comments_since = mock.Mock(  # type: ignore[method-assign]
+            side_effect=lambda _issue_id, since: [trig] if since != trig.id else []
+        )
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocking_run_resume(**kwargs: Any) -> tuple[str, None]:
+            entered.set()
+            release.wait(5)
+            return ("Done!", None)
+
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config",
+                return_value=ProjectConfig(),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.run_resume",
+                side_effect=blocking_run_resume,
+            ),
+        ):
+            thread = threading.Thread(target=orchestrator._resume_pipeline, args=(ts,))
+            thread.start()
+            assert entered.wait(5)
+            # Input fixed: the marker is the triggering comment's id.
+            with orchestrator._task_lock:
+                marker = orchestrator._turn_input_marker["ticket-1"]
+            assert marker == "cmt-trigger"
+            # The tick's warning pass while the turn runs must stay silent.
+            orchestrator._warn_ignored_comments(orchestrator._state.get("ticket-1"))
+            ts_after = orchestrator._state.get("ticket-1")
+            assert ts_after is not None
+            assert ts_after.last_seen_comment_id == "cmt-seen-1"
+            release.set()
+            thread.join(5)
+        assert not thread.is_alive()
+        posted = [body for _tid, body in linear.calls.get("post_comment", [])]
+        assert not any("I did not read this" in b for b in posted)
+        # The turn itself completed normally.
+        assert any("Done!" in b for b in posted)
+
 
 # ---------------------------------------------------------------------------
 # Project config integration in resume pipeline
@@ -4039,6 +4122,489 @@ class TestTick:
         assert sr.session_id == "ses-new"
         assert sr.last_seen_comment_id == "cmt-new"
 
+    # --- Mid-turn comment warnings (step-4 working branch) ---
+
+    def _simulate_in_flight(
+        self,
+        orchestrator: Orchestrator,
+        tid: str = "ticket-1",
+        marker: str | None = "cmt-trigger",
+    ) -> None:
+        """Plant a not-done future and a turn-input marker, as a pipeline that
+        already fixed its input would leave them."""
+        orchestrator._active_tasks[tid] = Future()
+        orchestrator._turn_input_marker[tid] = marker
+
+    def _posted_bodies(self, linear: FakeLinearClient) -> list[str]:
+        return [body for _issue_id, body in linear.calls.get("post_comment", [])]
+
+    def test_working_in_flight_warns_once_and_advances(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """Mid-turn human comment + task in flight → one 'ignored' comment, marker advanced.
+
+        The warning is read-only with respect to persisted state:
+        last_seen_comment_id stays untouched, so restart recovery can still
+        replay the comments that started the turn.
+        """
+        self._add_state(
+            orchestrator,
+            status=TicketStatus.working,
+            session_id="ses-abc",
+            last_seen_comment_id="cmt-seen-1",
+        )
+        linear.set_response("list_triggered_issues", [_make_issue()])
+        linear.set_response(
+            "list_comments_since",
+            [
+                _make_comment("cmt-human-1", "first mid-turn comment"),
+                _make_comment("cmt-human-2", "second mid-turn comment"),
+            ],
+        )
+        self._simulate_in_flight(orchestrator)
+
+        with mock.patch.object(orchestrator, "_rerun_interrupted_turn") as m_rerun:
+            orchestrator._tick()
+            time.sleep(0.2)
+
+        m_rerun.assert_not_called()
+        # Exactly one warning, verbatim body with the 'ignored' footer kind.
+        posts = self._posted_bodies(linear)
+        assert posts == [_IGNORED_COMMENT_BODY + "\n\n*Symphony · ignored*"]
+        # Only the in-memory turn marker advances to the *newest* human
+        # comment; last_seen stays untouched (read-only warning).
+        ts = orchestrator._state.get("ticket-1")
+        assert ts is not None
+        assert ts.last_seen_comment_id == "cmt-seen-1"
+        assert orchestrator._turn_input_marker["ticket-1"] == "cmt-human-2"
+
+    def test_warned_comment_survives_restart_for_replay(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """A mid-turn warning must not eat restart recovery's replay input.
+
+        The sequence from code review: a resume turn consumes H1, a human
+        posts H2 mid-turn, the tick warns about H2 (the turn marker
+        advances, but last_seen_comment_id stays put), then the daemon
+        restarts.  The ticket is stuck in working with no task in flight,
+        so the next tick must reach _rerun_interrupted_turn, which fetches
+        pending comments from last_seen (before H1) and replays both H1
+        and H2 — not a 'nothing to re-run' park.
+        """
+        self._add_state(
+            orchestrator,
+            status=TicketStatus.working,
+            session_id="ses-abc",
+            last_seen_comment_id="cmt-seen-1",
+        )
+        linear.set_response("list_triggered_issues", [_make_issue()])
+        h1 = _make_comment("cmt-h1", "please fix")
+        h2 = _make_comment("cmt-h2", "also this")
+        # The resume turn consumed H1 and fixed its input at H1; H2 is the
+        # mid-turn comment.  Once the warning advances the marker to H2,
+        # the fetch sees nothing new.
+        linear.list_comments_since = mock.Mock(  # type: ignore[method-assign]
+            side_effect=lambda _issue_id, since: [h2] if since == "cmt-h1" else [h1, h2]
+        )
+        self._simulate_in_flight(orchestrator, marker="cmt-h1")
+
+        # Tick 1: turn in flight, H2 warned about; last_seen untouched.
+        with mock.patch.object(orchestrator, "_rerun_interrupted_turn") as m_rerun:
+            orchestrator._tick()
+            time.sleep(0.2)
+        m_rerun.assert_not_called()
+        assert self._posted_bodies(linear) == [
+            _IGNORED_COMMENT_BODY + "\n\n*Symphony · ignored*"
+        ]
+        ts = orchestrator._state.get("ticket-1")
+        assert ts is not None
+        assert ts.last_seen_comment_id == "cmt-seen-1"
+
+        # Restart: the task and the in-memory marker are gone; the ticket
+        # stays working.  Recovery must replay H1 (the comment that started
+        # the turn) and H2 (the one warned about) — both are pending since
+        # last_seen was never advanced past them.
+        orchestrator._active_tasks.clear()
+        orchestrator._turn_input_marker.clear()
+        with mock.patch.object(orchestrator, "_resume_pipeline") as m_resume:
+            orchestrator._tick()
+            time.sleep(0.2)
+        m_resume.assert_called_once()
+        assert m_resume.call_args.kwargs["replay_message"] == _format_comments_message(
+            [h1, h2]
+        )
+
+    def test_task_finishes_while_fetch_blocks_no_warn(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """The turn completes while the comment fetch is blocked → no notice.
+
+        A 'I'm mid-turn' comment posted after the turn's final reply already
+        went out would be confusing, so the warning is dropped when the
+        in-flight check fails after the fetch.
+        """
+        ts = self._add_state(
+            orchestrator,
+            status=TicketStatus.working,
+            session_id="ses-abc",
+            last_seen_comment_id="cmt-seen-1",
+        )
+        fut: Future[None] = Future()
+        entered = threading.Event()
+        release = threading.Event()
+        orchestrator._active_tasks["ticket-1"] = fut
+        orchestrator._turn_input_marker["ticket-1"] = "cmt-trigger"
+
+        def blocking_fetch(_issue_id: str, _since: str | None) -> list[Comment]:
+            entered.set()
+            release.wait(5)
+            return [_make_comment("cmt-human", "mid-turn comment")]
+
+        linear.list_comments_since = mock.Mock(  # type: ignore[method-assign]
+            side_effect=blocking_fetch
+        )
+
+        thread = threading.Thread(
+            target=orchestrator._warn_ignored_comments, args=(ts,)
+        )
+        thread.start()
+        assert entered.wait(5)
+        # The turn finishes while the fetch is still blocked; _task_wrapper
+        # pops the marker with the task.
+        fut.set_result(None)
+        with orchestrator._task_lock:
+            orchestrator._turn_input_marker.pop("ticket-1", None)
+        release.set()
+        thread.join(5)
+        assert not thread.is_alive()
+        assert self._posted_bodies(linear) == []
+        assert "ticket-1" not in orchestrator._turn_input_marker
+
+    def test_working_in_flight_no_pending_comments_no_warn(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """Task in flight but no new human comments (bot-only) → no warning, no advance."""
+        self._add_state(
+            orchestrator,
+            status=TicketStatus.working,
+            session_id="ses-abc",
+            last_seen_comment_id="cmt-seen-1",
+        )
+        linear.set_response("list_triggered_issues", [_make_issue()])
+        linear.set_response(
+            "list_comments_since",
+            [
+                _make_comment(
+                    "cmt-bot", "Bot message\n\n*Symphony · final*", user_id="usr-bot"
+                )
+            ],
+        )
+        self._simulate_in_flight(orchestrator)
+
+        with mock.patch.object(orchestrator, "_rerun_interrupted_turn") as m_rerun:
+            orchestrator._tick()
+            time.sleep(0.2)
+
+        m_rerun.assert_not_called()
+        assert self._posted_bodies(linear) == []
+        ts = orchestrator._state.get("ticket-1")
+        assert ts is not None
+        assert ts.last_seen_comment_id == "cmt-seen-1"
+
+    def test_working_no_task_in_flight_no_warn(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """Working with pending comments but NO task in flight → recovery scheduled,
+        no warning, marker untouched (pending comments stay intact for the replay)."""
+        self._add_state(
+            orchestrator,
+            status=TicketStatus.working,
+            session_id="ses-abc",
+            last_seen_comment_id="cmt-seen-1",
+        )
+        linear.set_response("list_triggered_issues", [_make_issue()])
+        linear.set_response(
+            "list_comments_since", [_make_comment("cmt-human", "hello")]
+        )
+
+        with mock.patch.object(orchestrator, "_rerun_interrupted_turn") as m_rerun:
+            orchestrator._tick()
+            time.sleep(0.2)
+
+        m_rerun.assert_called_once()
+        assert self._posted_bodies(linear) == []
+        ts = orchestrator._state.get("ticket-1")
+        assert ts is not None
+        assert ts.last_seen_comment_id == "cmt-seen-1"
+
+    def test_working_in_flight_no_second_warning_on_next_tick(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """The marker advance silences the following tick for the same input."""
+        self._add_state(
+            orchestrator,
+            status=TicketStatus.working,
+            session_id="ses-abc",
+            last_seen_comment_id="cmt-seen-1",
+        )
+        linear.set_response("list_triggered_issues", [_make_issue()])
+        human = _make_comment("cmt-human", "mid-turn comment")
+        # Emulate the tracker's positional semantics: the comment is only
+        # "new" while the since point sits before it.  The first tick warns
+        # (since = the turn marker), and the warning advances the turn
+        # marker past the comment, so the second tick fetches since the
+        # comment and finds nothing.
+        linear.list_comments_since = mock.Mock(  # type: ignore[method-assign]
+            side_effect=lambda _issue_id, comment_id: (
+                [human] if comment_id == "cmt-trigger" else []
+            )
+        )
+        self._simulate_in_flight(orchestrator)
+
+        orchestrator._tick()
+        time.sleep(0.2)
+        orchestrator._tick()
+        time.sleep(0.2)
+
+        # One warning total across both ticks.
+        assert self._posted_bodies(linear) == [
+            _IGNORED_COMMENT_BODY + "\n\n*Symphony · ignored*"
+        ]
+        ts = orchestrator._state.get("ticket-1")
+        assert ts is not None
+        # The warning is read-only: last_seen stays untouched; only the
+        # in-memory turn marker advances (that is the re-warn guard).
+        assert ts.last_seen_comment_id == "cmt-seen-1"
+        assert orchestrator._turn_input_marker["ticket-1"] == "cmt-human"
+
+    def test_working_in_flight_warn_post_failure_still_advances(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """A failing warning post must not cause per-tick spam: markers still advance."""
+        self._add_state(
+            orchestrator,
+            status=TicketStatus.working,
+            session_id="ses-abc",
+            last_seen_comment_id="cmt-seen-1",
+        )
+        linear.set_response("list_triggered_issues", [_make_issue()])
+        human = _make_comment("cmt-human", "mid-turn comment")
+        linear.list_comments_since = mock.Mock(  # type: ignore[method-assign]
+            side_effect=lambda _issue_id, comment_id: (
+                [human] if comment_id == "cmt-trigger" else []
+            )
+        )
+        linear.set_response("post_comment", LinearError("boom"))
+        self._simulate_in_flight(orchestrator)
+
+        orchestrator._tick()
+        time.sleep(0.2)
+        orchestrator._tick()
+        time.sleep(0.2)
+
+        # One failed post attempt, never retried on the next tick.
+        assert len(linear.calls.get("post_comment", [])) == 1
+        ts = orchestrator._state.get("ticket-1")
+        assert ts is not None
+        # Read-only warning: last_seen untouched; the turn marker advances
+        # so the failed post is never retried.
+        assert ts.last_seen_comment_id == "cmt-seen-1"
+        assert orchestrator._turn_input_marker["ticket-1"] == "cmt-human"
+
+    def test_working_in_flight_fetch_failure_does_not_advance(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """A failed comment fetch leaves the marker untouched (next tick retries)."""
+        self._add_state(
+            orchestrator,
+            status=TicketStatus.working,
+            session_id="ses-abc",
+            last_seen_comment_id="cmt-seen-1",
+        )
+        linear.set_response("list_triggered_issues", [_make_issue()])
+        linear.list_comments_since = mock.Mock(  # type: ignore[method-assign]
+            side_effect=LinearError("boom")
+        )
+        self._simulate_in_flight(orchestrator)
+
+        with mock.patch.object(orchestrator, "_rerun_interrupted_turn") as m_rerun:
+            orchestrator._tick()
+            time.sleep(0.2)
+
+        m_rerun.assert_not_called()
+        assert self._posted_bodies(linear) == []
+        ts = orchestrator._state.get("ticket-1")
+        assert ts is not None
+        assert ts.last_seen_comment_id == "cmt-seen-1"
+        assert orchestrator._turn_input_marker["ticket-1"] == "cmt-trigger"
+
+    def test_working_in_flight_untriggered_no_warn(
+        self,
+        tmp_path: Path,
+        state_mgr: StateManager,
+        linear: FakeLinearClient,
+    ) -> None:
+        """In-flight task + not in the trigger list → the untriggered guard wins, no warn."""
+        config = _make_config(tmp_path)
+        orch = Orchestrator(
+            config=config,
+            state=state_mgr,
+            tracker=LinearTracker(linear=linear, config=config.linear),
+            workspace=tmp_path / "ws",
+        )  # type: ignore[arg-type]
+        ts = TicketState(
+            ticket_id="ticket-1",
+            ticket_identifier="TEAM-1",
+            repo_url="https://x",
+            workspace_path="/tmp/ws/TEAM-1",
+            branch="main",
+            status=TicketStatus.working,
+            session_id="ses-abc",
+            last_seen_comment_id="cmt-seen-1",
+        )
+        orch._state.upsert(ts)
+        # Missing from the poll list, but still triggered per get_issue, so
+        # step-3 cleanup leaves the entry alone.
+        linear.set_response("list_triggered_issues", [])
+        linear.set_response(
+            "get_issue", _make_issue(state="In Progress", labels=["Agent"])
+        )
+        orch._active_tasks["ticket-1"] = Future()
+
+        with (
+            mock.patch.object(orch, "_warn_ignored_comments") as m_warn,
+            mock.patch.object(orch, "_rerun_interrupted_turn") as m_rerun,
+        ):
+            orch._tick()
+            time.sleep(0.2)
+
+        m_warn.assert_not_called()
+        m_rerun.assert_not_called()
+        assert self._posted_bodies(linear) == []
+
+    def test_working_in_flight_cleanup_refused_no_warn(
+        self,
+        tmp_path: Path,
+        state_mgr: StateManager,
+        linear: FakeLinearClient,
+    ) -> None:
+        """In-flight task + cleanup-refused → the refusal guard wins, no warn."""
+        config = _make_config(tmp_path)
+        orch = Orchestrator(
+            config=config,
+            state=state_mgr,
+            tracker=LinearTracker(linear=linear, config=config.linear),
+            workspace=tmp_path / "ws",
+        )  # type: ignore[arg-type]
+        ts = TicketState(
+            ticket_id="ticket-1",
+            ticket_identifier="TEAM-1",
+            repo_url="https://x",
+            workspace_path="/tmp/ws/TEAM-1",
+            branch="main",
+            status=TicketStatus.working,
+            session_id="ses-abc",
+            last_seen_comment_id="cmt-seen-1",
+            cleanup_refused_state="Needs Input",
+        )
+        orch._state.upsert(ts)
+        linear.set_response("list_triggered_issues", [_make_issue()])
+        orch._active_tasks["ticket-1"] = Future()
+
+        with (
+            mock.patch.object(orch, "_warn_ignored_comments") as m_warn,
+            mock.patch.object(orch, "_rerun_interrupted_turn") as m_rerun,
+        ):
+            orch._tick()
+            time.sleep(0.2)
+
+        m_warn.assert_not_called()
+        m_rerun.assert_not_called()
+        assert self._posted_bodies(linear) == []
+
+    def test_working_in_flight_in_qa_no_warn(
+        self,
+        tmp_path: Path,
+        state_mgr: StateManager,
+        linear: FakeLinearClient,
+    ) -> None:
+        """In-flight task + ticket in qa_state → the QA guard wins, no warn."""
+        config = _make_config(tmp_path, linear={"qa_state": "In Review"})
+        orch = Orchestrator(
+            config=config,
+            state=state_mgr,
+            tracker=LinearTracker(linear=linear, config=config.linear),
+            workspace=tmp_path / "ws",
+        )  # type: ignore[arg-type]
+        ts = TicketState(
+            ticket_id="ticket-1",
+            ticket_identifier="TEAM-1",
+            repo_url="https://x",
+            workspace_path="/tmp/ws/TEAM-1",
+            branch="main",
+            status=TicketStatus.working,
+            session_id="ses-abc",
+            last_seen_comment_id="cmt-seen-1",
+        )
+        orch._state.upsert(ts)
+        linear.set_response("list_triggered_issues", [_make_issue(state="In Review")])
+        orch._active_tasks["ticket-1"] = Future()
+
+        with (
+            mock.patch.object(orch, "_warn_ignored_comments") as m_warn,
+            mock.patch.object(orch, "_rerun_interrupted_turn") as m_rerun,
+            mock.patch(
+                "symphony_linear.orchestrator.start_serve",
+                return_value=_make_fake_proc(),
+            ),
+        ):
+            orch._tick()
+            time.sleep(0.2)
+
+        m_warn.assert_not_called()
+        m_rerun.assert_not_called()
+        assert self._posted_bodies(linear) == []
+
+    def test_working_in_flight_input_not_fixed_no_warn(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """Task in flight but the turn's input is not fixed yet (no marker) →
+        no warning: a pending comment cannot be told apart from the comment
+        that triggered the turn."""
+        self._add_state(
+            orchestrator,
+            status=TicketStatus.working,
+            session_id="ses-abc",
+            last_seen_comment_id="cmt-seen-1",
+        )
+        linear.set_response("list_triggered_issues", [_make_issue()])
+        linear.set_response(
+            "list_comments_since", [_make_comment("cmt-human-1", "mid-turn comment")]
+        )
+        # Task in flight, but no turn marker: the pipeline is still preparing
+        # its input (e.g. cloning), so nothing has been fixed yet.
+        orchestrator._active_tasks["ticket-1"] = Future()
+
+        with mock.patch.object(orchestrator, "_rerun_interrupted_turn") as m_rerun:
+            orchestrator._tick()
+            time.sleep(0.2)
+
+        m_rerun.assert_not_called()
+        assert self._posted_bodies(linear) == []
+        ts = orchestrator._state.get("ticket-1")
+        assert ts is not None
+        assert ts.last_seen_comment_id == "cmt-seen-1"
+        assert "ticket-1" not in orchestrator._turn_input_marker
+
+    def test_task_wrapper_pops_turn_input_marker(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """_task_wrapper cleans up the turn-input marker with the task, so a
+        stale marker can never leak into the next turn."""
+        orchestrator._turn_input_marker["ticket-1"] = "cmt-trigger"
+        orchestrator._task_wrapper("ticket-1", lambda: None)
+        assert "ticket-1" not in orchestrator._turn_input_marker
+
 
 # ---------------------------------------------------------------------------
 # Startup recovery
@@ -4222,6 +4788,9 @@ class TestRerunInterruptedTurn:
             "re-running the last turn" in b and "attempt 1 of 3" in b for b in posted
         )
         assert not any("Reply to continue" in b for b in posted)
+        # The replay path fixed its input via a fresh baseline fetch: the
+        # turn marker is the newest comment id at that moment.
+        assert orchestrator._turn_input_marker.get("ticket-1") == "cmt-new"
 
     def test_resume_rerun_mocked_pipeline(
         self, orchestrator: Orchestrator, linear: FakeLinearClient

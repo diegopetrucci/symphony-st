@@ -67,6 +67,13 @@ _RESTART_NOTICE_BODY = (
     "**Symphony**: Restarted before setup completed. "
     "Picking this ticket up again on the next poll."
 )
+# Posted (once) when a human comment lands while a turn is genuinely
+# running.  The em dash and apostrophes are deliberate; keep verbatim.
+_IGNORED_COMMENT_BODY = (
+    "**I did not read this — I'm mid-turn.**\n\n"
+    "I'll post my reply when this turn finishes. Comment again after that "
+    "and I'll pick it up."
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -169,6 +176,16 @@ class Orchestrator:
         # Active task guard.
         self._active_tasks: dict[str, Future[None]] = {}
         self._task_lock = threading.Lock()
+
+        # Per-turn input markers (guarded by _task_lock).  Key present means
+        # "this turn's input is fixed"; the value is the id of the newest
+        # comment on the ticket at that moment (None when there were none).
+        # _warn_ignored_comments measures "pending" from this marker so it
+        # never accuses the comment that started the turn, and never touches
+        # last_seen_comment_id mid-turn (which would leave restart recovery
+        # nothing to replay).  In-memory by design: per-turn, and on restart
+        # the map is empty, nothing warns, recovery behaves as today.
+        self._turn_input_marker: dict[str, str | None] = {}
 
         # Active QA serve process (in-memory only; not persisted).
         self._active_serve: _ActiveServe | None = None
@@ -711,6 +728,16 @@ class Orchestrator:
                     if self._tracker.is_in_qa(fetched):
                         logger.debug("Skipping recovery for working QA ticket %s", tid)
                         continue
+                    if self._is_task_in_flight(tid):
+                        # A turn is genuinely running right now (as opposed to a
+                        # ticket stuck in working because a turn was interrupted):
+                        # the running turn will not consume a mid-turn comment, so
+                        # acknowledge it explicitly instead of discarding it in
+                        # silence.  _rerun_interrupted_turn is scheduled only when
+                        # no task is in flight — that path replays pending comments
+                        # as its input and must not have them warned away.
+                        self._warn_ignored_comments(ticket_state)
+                        continue
                     self._schedule_task(
                         tid, self._rerun_interrupted_turn, ticket_state, fetched
                     )
@@ -1085,6 +1112,20 @@ class Orchestrator:
     # Task scheduling
     # ==================================================================
 
+    def _is_task_in_flight(self, ticket_id: str) -> bool:
+        """Return True if a task for *ticket_id* is currently running.
+
+        Mirrors the ``_active_tasks`` lookup :meth:`_schedule_task` uses,
+        under the same lock.  This is the only reliable signal that a turn
+        is genuinely running right now: ``TicketStatus.working`` also
+        covers turns interrupted by a daemon restart or a dead pipeline
+        thread, and those must not warn (recovery replays pending comments
+        as input).
+        """
+        with self._task_lock:
+            existing = self._active_tasks.get(ticket_id)
+            return existing is not None and not existing.done()
+
     def _schedule_task(self, ticket_id: str, target: Any, *args: Any) -> None:
         with self._task_lock:
             existing = self._active_tasks.get(ticket_id)
@@ -1101,6 +1142,7 @@ class Orchestrator:
         finally:
             with self._task_lock:
                 self._active_tasks.pop(ticket_id, None)
+                self._turn_input_marker.pop(ticket_id, None)
             with self._subprocess_lock:
                 self._subprocesses.pop(ticket_id, None)
                 self._cancelled.discard(ticket_id)
@@ -1501,6 +1543,16 @@ class Orchestrator:
             self._state.upsert(ticket_state)
             self._state.save()
 
+        # The turn's input is now fixed: record the newest comment id so
+        # _warn_ignored_comments only flags comments arriving after this
+        # point, never the comments this turn is consuming.  A failed
+        # baseline fetch (None) is accepted imprecision: the turn then warns
+        # about pre-existing comments once, and the marker advances past
+        # them on that warning.
+        marker = self._baseline_comment_id(tid)
+        with self._task_lock:
+            self._turn_input_marker[tid] = marker
+
         # Compute effective turn timeout from project config, falling back to global.
         effective_turn_timeout = (
             project_config.turn_timeout_seconds or self._config.turn_timeout_seconds
@@ -1789,6 +1841,21 @@ class Orchestrator:
             self._state.upsert(ticket_state)
             self._state.save()
 
+        # The turn's input is now fixed: record the newest comment id so
+        # _warn_ignored_comments only flags comments arriving after this
+        # point, never the comment(s) this turn is consuming.
+        marker: str | None
+        if replay_message is None:
+            # new_comments is the unfiltered fetch from above; its last
+            # element is the newest comment on the ticket at fetch time.
+            marker = new_comments[-1].id
+        else:
+            # The caller only passed the formatted text, so fetch the
+            # newest comment id fresh (None if the fetch fails).
+            marker = self._baseline_comment_id(tid)
+        with self._task_lock:
+            self._turn_input_marker[tid] = marker
+
         if self._is_cancelled(tid):
             return
 
@@ -2066,6 +2133,54 @@ class Orchestrator:
         except Exception:
             logger.exception("Failed to list comments for %s", issue_id)
             return None
+
+    def _warn_ignored_comments(self, ticket_state: TicketState) -> None:
+        """Tell the human their mid-turn comment was not read (once per comment).
+
+        Called from tick step 4 while a task for a ``working`` ticket is in
+        flight; such comments are never consumed by the running turn, so
+        without the notice they would be discarded in silence.  Advances
+        the turn marker past the newest human comment to keep later ticks
+        quiet.
+
+        Read-only with respect to persisted state: never touches
+        ``last_seen_comment_id``, the anchor restart recovery replays from.
+
+        "Pending" is measured from the per-turn ``_turn_input_marker``, never
+        ``last_seen_comment_id``; an absent key means the input is not yet
+        fixed — stay silent (presence gate, not an error).
+        """
+        tid = ticket_state.ticket_id
+        with self._task_lock:
+            if tid not in self._turn_input_marker:
+                # The turn is in flight but its input is not fixed yet: a
+                # pending comment cannot be told apart from the triggering
+                # one, so stay silent.
+                return
+            since = self._turn_input_marker[tid]
+        try:
+            comments = self._tracker.list_comments_since(tid, since)
+        except Exception:
+            logger.exception("Failed to list comments for %s", tid)
+            return
+        if not self._is_task_in_flight(tid):
+            # The turn finished (or was cancelled) while the fetch blocked:
+            # it posted its final reply and advanced last_seen, or is being
+            # torn down — either way a notice claiming to be mid-turn now
+            # would be confusing, so stay silent.
+            return
+        human_comments = [c for c in comments if not is_bot_comment(c.body)]
+        if not human_comments:
+            return
+        self._post_comment_safe(tid, _IGNORED_COMMENT_BODY, kind="ignored")
+        with self._task_lock:
+            # Advance the turn marker past the warned comment too, so the
+            # next tick does not warn again about the same input.  Only when
+            # the entry is still there: if the task finished while the
+            # warning was posting, _task_wrapper popped it, and re-adding a
+            # stale value would mislead the next turn's presence-gate.
+            if tid in self._turn_input_marker:
+                self._turn_input_marker[tid] = human_comments[-1].id
 
     # ==================================================================
     # Signal handling and shutdown
