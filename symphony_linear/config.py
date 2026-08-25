@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import (
@@ -218,6 +218,10 @@ class AppConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    agent: Literal["opencode", "omp"] = Field(
+        "opencode",
+        description="Coding-agent CLI to run: 'opencode' (default) or 'omp'",
+    )
     linear: _LinearConfig | None = Field(
         None, description="Linear backend configuration block"
     )

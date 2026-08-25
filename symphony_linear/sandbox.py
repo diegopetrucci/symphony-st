@@ -15,6 +15,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from symphony_linear.sandbox_path import resolve_sandbox_path
+
 
 def _expand(path: str) -> str:
     """Expand ``~`` and resolve symlinks in *path*."""
@@ -148,8 +150,10 @@ def run_in_sandbox(
     # Both are needed so `--session <id>` resume works inside the sandbox.
     opencode_legacy = str(Path("~/.opencode").expanduser())
     opencode_xdg = str(Path("~/.local/share/opencode").expanduser())
+    omp_dir = str(Path("~/.omp").expanduser())
     bwrap_args.extend(["--bind-try", opencode_legacy, opencode_legacy])
     bwrap_args.extend(["--bind-try", opencode_xdg, opencode_xdg])
+    bwrap_args.extend(["--bind-try", omp_dir, omp_dir])
 
     # 5. Extra read-write paths (applied before hide_paths so hide wins on
     #    collision — later bwrap mounts override earlier ones).
@@ -219,16 +223,9 @@ def run_in_sandbox(
     bwrap_args.append("--clearenv")
 
     # Resolve PATH if the caller did not supply one explicitly.
-    # Priority: caller-supplied PATH > SYMPHONY_SANDBOX_PATH env var >
-    # daemon's own os.environ["PATH"] > hard-coded fallback.
     env_to_set = dict(env)
     if "PATH" not in env_to_set:
-        if "SYMPHONY_SANDBOX_PATH" in os.environ:
-            env_to_set["PATH"] = os.environ["SYMPHONY_SANDBOX_PATH"]
-        elif "PATH" in os.environ:
-            env_to_set["PATH"] = os.environ["PATH"]
-        else:
-            env_to_set["PATH"] = "/usr/local/bin:/usr/bin:/bin"
+        env_to_set["PATH"] = resolve_sandbox_path(env_to_set)
     for key, value in env_to_set.items():
         bwrap_args.extend(["--setenv", key, value])
 

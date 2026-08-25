@@ -34,13 +34,17 @@ class TicketStatus(str, Enum):
 
 
 class SessionRecord(BaseModel):
-    """Persistent mapping from ticket_id to the last known OpenCode session.
+    """Persistent mapping from ticket_id to the last known agent session.
 
     Survives workspace cleanup so a re-triggered ticket can resume its
     previous session instead of starting a fresh one.
     """
 
-    session_id: str = Field(..., description="OpenCode session identifier")
+    session_id: str = Field(..., description="Agent session identifier")
+    agent: str | None = Field(
+        None,
+        description="Agent that created the session; None means legacy OpenCode",
+    )
     last_seen_comment_id: str | None = Field(
         None,
         description="Last comment ID the bot had seen when the session was snapshotted",
@@ -61,7 +65,11 @@ class TicketState(BaseModel):
     )
     project_id: str | None = Field(None, description="Linear project ID")
     repo_url: str = Field(..., description="Clone URL of the repository")
-    session_id: str | None = Field(None, description="OpenCode session identifier")
+    session_id: str | None = Field(None, description="Agent session identifier")
+    agent: str | None = Field(
+        None,
+        description="Agent that created the session; None means legacy OpenCode",
+    )
     workspace_path: str = Field(..., description="Path to the workspace on disk")
     branch: str = Field(..., description="Git branch name for this ticket")
     last_seen_comment_id: str | None = Field(

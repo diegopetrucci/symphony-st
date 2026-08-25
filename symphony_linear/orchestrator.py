@@ -13,18 +13,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from symphony_linear import omp, opencode
+from symphony_linear.agent_runner import AgentCancelled, AgentError, AgentTimeout
 from symphony_linear.attachments import process_attachments
 from symphony_linear.config import AppConfig
 from symphony_linear.linear import (
     Comment,
     Issue,
-)
-from symphony_linear.opencode import (
-    OpenCodeCancelled,
-    OpenCodeError,
-    OpenCodeTimeout,
-    run_initial,
-    run_resume,
 )
 from symphony_linear.project_config import (
     ProjectConfigError,
@@ -56,6 +51,14 @@ from symphony_linear.workspace import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Module-level aliases for the OpenCode adapter.  They exist only so the
+# long-standing `symphony_linear.orchestrator.run_initial` patch target keeps
+# working for the existing tests; OMP is reached through `omp.<name>` instead.
+# Both go through _agent_callables — neither alias carries any meaning beyond
+# being a stable patch seam.
+run_initial = opencode.run_initial
+run_resume = opencode.run_resume
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -111,6 +114,13 @@ def _format_comments_message(comments: list[Comment]) -> str:
         author = c.user_id or "unknown"
         parts.append(f"[{author} at {c.created_at}]\n{c.body}")
     return "\n\n".join(parts)
+
+
+def _agent_callables(agent: str) -> tuple[Any, Any]:
+    """Return the initial and resume callables for a configured agent."""
+    if agent == "opencode":
+        return run_initial, run_resume
+    return omp.run_initial, omp.run_resume
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +341,18 @@ class Orchestrator:
                 exc_info=True,
             )
             return
+
+        if (
+            ticket_state.session_id is not None
+            and not self._session_matches_current_agent(ticket_state.agent)
+        ):
+            logger.info(
+                "Recovery: discarding %s session for %s; configured agent is %s",
+                ticket_state.agent or "opencode",
+                tid,
+                self._config.agent,
+            )
+            self._drop_stale_session(ticket_state)
 
         if ticket_state.session_id is not None and pending is None:
             self._park_interrupted_turn(
@@ -636,6 +658,7 @@ class Orchestrator:
                         if ticket_state.session_id is not None:
                             record = SessionRecord(
                                 session_id=ticket_state.session_id,
+                                agent=ticket_state.agent or "opencode",
                                 last_seen_comment_id=ticket_state.last_seen_comment_id,
                             )
                             self._state.set_session(tid, record)
@@ -671,6 +694,7 @@ class Orchestrator:
                 if ticket_state.session_id is not None:
                     record = SessionRecord(
                         session_id=ticket_state.session_id,
+                        agent=ticket_state.agent or "opencode",
                         last_seen_comment_id=ticket_state.last_seen_comment_id,
                     )
                     self._state.set_session(tid, record)
@@ -1413,6 +1437,17 @@ class Orchestrator:
 
         # --- Rehydrate from session snapshot (if any) ---
         session_record = self._state.get_session(tid)
+        if session_record is not None and not self._session_matches_current_agent(
+            session_record.agent
+        ):
+            logger.info(
+                "Discarding %s session snapshot for %s; configured agent is %s",
+                session_record.agent or "opencode",
+                tid,
+                self._config.agent,
+            )
+            self._drop_stale_session(ticket_state)
+            session_record = None
         if session_record is not None:
             logger.info(
                 "Rehydrating session for %s from persistent snapshot (session=%s)",
@@ -1420,6 +1455,7 @@ class Orchestrator:
                 session_record.session_id,
             )
             ticket_state.session_id = session_record.session_id
+            ticket_state.agent = self._config.agent
             ticket_state.last_seen_comment_id = session_record.last_seen_comment_id
             ticket_state.status = TicketStatus.needs_input
             ticket_state.updated_at = _iso_now()
@@ -1531,7 +1567,7 @@ class Orchestrator:
         if self._is_cancelled(tid):
             return
 
-        # --- Run OpenCode (B3: pass hide_paths) ---
+        # --- Run agent (B3: pass hide_paths) ---
         ticket_state.status = TicketStatus.working
         # Agent takes a turn — re-arm the dirty-workspace guard.
         ticket_state.cleanup_refused_state = None
@@ -1559,7 +1595,8 @@ class Orchestrator:
         )
 
         try:
-            session_id, final_message, _context_tokens = run_initial(
+            agent_run_initial, _ = _agent_callables(self._config.agent)
+            session_id, final_message, _context_tokens = agent_run_initial(
                 workspace_path=workspace_path,
                 prompt=prompt,
                 timeout_seconds=effective_turn_timeout,
@@ -1575,8 +1612,8 @@ class Orchestrator:
                 files=files,
                 model=model,
             )
-        except OpenCodeTimeout as exc:
-            logger.error("OpenCode turn timed out for %s", tid)
+        except AgentTimeout as exc:
+            logger.error("Agent turn timed out for %s", tid)
             body = f"**Symphony error**: The AI turn timed out ({exc.reason})."
             if exc.partial_message:
                 body += (
@@ -1595,14 +1632,17 @@ class Orchestrator:
                 if err_comment is not None:
                     ticket_state.last_seen_comment_id = err_comment.id  # B1
                 ticket_state.session_id = exc.session_id  # salvaged session, if any
+                ticket_state.agent = (
+                    self._config.agent if exc.session_id is not None else None
+                )
                 self._state.upsert(ticket_state)
                 self._state.save()
             return
-        except OpenCodeCancelled:
-            logger.info("OpenCode turn cancelled for %s", tid)
+        except AgentCancelled:
+            logger.info("Agent turn cancelled for %s", tid)
             return
-        except OpenCodeError as exc:
-            logger.error("OpenCode failed for %s: %s", tid, exc)
+        except AgentError as exc:
+            logger.error("Agent failed for %s: %s", tid, exc)
             self._transition_failed_to_needs_input(tid)
             err_comment = self._post_comment_safe(
                 tid,
@@ -1615,6 +1655,7 @@ class Orchestrator:
                 if err_comment is not None:
                     ticket_state.last_seen_comment_id = err_comment.id  # B1
                 ticket_state.session_id = None  # ensure no-session path on retry
+                ticket_state.agent = None
                 self._state.upsert(ticket_state)
                 self._state.save()
             return
@@ -1636,6 +1677,7 @@ class Orchestrator:
                 logger.exception("Failed to edit metadata comment for %s", tid)
 
         ticket_state.session_id = session_id
+        ticket_state.agent = self._config.agent
         with self._state_lock:
             self._state.upsert(ticket_state)
             self._state.save()
@@ -1692,7 +1734,7 @@ class Orchestrator:
         *,
         replay_message: str | None = None,
     ) -> None:
-        """Resume an existing OpenCode session with new human comments.
+        """Resume an existing agent session with new human comments.
 
         *model* is the per-issue model override for the primary agent,
         resolved by the caller from the freshly fetched issue's labels
@@ -1735,6 +1777,29 @@ class Orchestrator:
             message = _format_comments_message(human_comments)
         else:
             message = replay_message
+
+        if (
+            ticket_state.session_id is not None
+            and not self._session_matches_current_agent(ticket_state.agent)
+        ):
+            logger.info(
+                "Discarding %s session for %s; configured agent is %s",
+                ticket_state.agent or "opencode",
+                tid,
+                self._config.agent,
+            )
+            self._drop_stale_session(ticket_state)
+            try:
+                issue = self._tracker.get_issue(tid)
+            except TrackerError:
+                logger.exception("Failed to fetch issue %s after agent switch", tid)
+                return
+            self._new_ticket_pipeline(
+                issue,
+                message,
+                recovering=replay_message is not None,
+            )
+            return
 
         # --- Process attachments ---
         # ensure_attachments_dir applies the path-containment security check
@@ -1865,7 +1930,8 @@ class Orchestrator:
         )
 
         try:
-            final_message, _context_tokens = run_resume(
+            _, agent_run_resume = _agent_callables(self._config.agent)
+            final_message, _context_tokens = agent_run_resume(
                 workspace_path=ticket_state.workspace_path,
                 session_id=ticket_state.session_id,
                 message=rewritten_message,
@@ -1882,8 +1948,8 @@ class Orchestrator:
                 files=files_attach,
                 model=model,
             )
-        except OpenCodeTimeout as exc:
-            logger.error("OpenCode resume timed out for %s", tid)
+        except AgentTimeout as exc:
+            logger.error("Agent resume timed out for %s", tid)
             body = f"**Symphony error**: The AI turn timed out ({exc.reason})."
             if exc.partial_message:
                 body += (
@@ -1904,11 +1970,11 @@ class Orchestrator:
                 self._state.upsert(ticket_state)
                 self._state.save()
             return
-        except OpenCodeCancelled:
-            logger.info("OpenCode resume cancelled for %s", tid)
+        except AgentCancelled:
+            logger.info("Agent resume cancelled for %s", tid)
             return
-        except OpenCodeError as exc:
-            logger.error("OpenCode resume failed for %s: %s", tid, exc)
+        except AgentError as exc:
+            logger.error("Agent resume failed for %s: %s", tid, exc)
             self._transition_failed_to_needs_input(tid)
             err_comment = self._post_comment_safe(
                 tid,
@@ -1969,6 +2035,23 @@ class Orchestrator:
     # ==================================================================
     # Shared helpers
     # ==================================================================
+
+    def _session_matches_current_agent(self, agent: str | None) -> bool:
+        """Whether a recorded session can be handed to the configured agent.
+
+        Session IDs are adapter-specific; an untagged legacy session is OpenCode.
+        """
+        return (agent or "opencode") == self._config.agent
+
+    def _drop_stale_session(self, ticket_state: TicketState) -> None:
+        """Forget an incompatible live session and its durable snapshot."""
+        ticket_state.session_id = None
+        ticket_state.agent = None
+        ticket_state.updated_at = _iso_now()
+        with self._state_lock:
+            self._state.remove_session(ticket_state.ticket_id)
+            self._state.upsert(ticket_state)
+            self._state.save()
 
     def _transition_failed_to_needs_input(self, tid: str) -> None:
         """Best-effort: move a failed ticket to the tracker's Needs Input state.

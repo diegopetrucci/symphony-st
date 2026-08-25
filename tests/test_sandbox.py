@@ -16,6 +16,7 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -459,6 +460,32 @@ class TestRunInSandbox:
         finally:
             if old_home:
                 os.environ["HOME"] = old_home
+
+    def test_omp_dir_bind_try_emitted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Emit an optional read-write bind for OMP state."""
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        fake_home = tmp_path / "fake_home"
+        fake_home.mkdir()
+        monkeypatch.setenv("HOME", str(fake_home))
+
+        with patch(
+            "symphony_linear.sandbox.shutil.which", return_value="/usr/bin/bwrap"
+        ):
+            with patch("symphony_linear.sandbox.subprocess.Popen") as popen_mock:
+                run_in_sandbox(
+                    cmd=["echo", "hello"],
+                    workspace_path=str(workspace),
+                    tmp_path=str(_make_ticket_tmp(tmp_path)),
+                    hide_paths=[],
+                    env={"HOME": str(fake_home)},
+                )
+
+        args = popen_mock.call_args[0][0]
+        omp_dir = str(fake_home / ".omp")
+        assert ("--bind-try", omp_dir, omp_dir) in zip(args, args[1:], args[2:])
 
     def test_extra_rw_paths_writable(self, tmp_path: Path) -> None:
         """Verify that extra_rw_paths are writable inside the sandbox."""

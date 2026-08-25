@@ -54,15 +54,17 @@ class TestTicketState:
             branch="feature/ticket-42",
         )
         assert ts.ticket_id == "42"
+        assert ts.agent is None
         assert ts.status == TicketStatus.bootstrapping
         assert ts.created_at is not None
         assert ts.updated_at is not None
 
     def test_json_roundtrip(self) -> None:
-        ts = _make_ticket("1", status=TicketStatus.working)
+        ts = _make_ticket("1", status=TicketStatus.working, agent="omp")
         data = ts.model_dump(mode="json")
         restored = TicketState.model_validate(data)
         assert restored.ticket_id == ts.ticket_id
+        assert restored.agent == "omp"
         assert restored.status == ts.status
         assert restored.created_at == ts.created_at
 
@@ -232,19 +234,32 @@ class TestSessionRecord:
     def test_create_minimal(self) -> None:
         sr = SessionRecord(session_id="ses-abc")
         assert sr.session_id == "ses-abc"
+        assert sr.agent is None
         assert sr.last_seen_comment_id is None
 
     def test_create_full(self) -> None:
-        sr = SessionRecord(session_id="ses-abc", last_seen_comment_id="cmt-42")
+        sr = SessionRecord(
+            session_id="ses-abc", agent="omp", last_seen_comment_id="cmt-42"
+        )
         assert sr.session_id == "ses-abc"
+        assert sr.agent == "omp"
         assert sr.last_seen_comment_id == "cmt-42"
 
     def test_json_roundtrip(self) -> None:
-        sr = SessionRecord(session_id="ses-abc", last_seen_comment_id="cmt-42")
+        sr = SessionRecord(
+            session_id="ses-abc", agent="omp", last_seen_comment_id="cmt-42"
+        )
         data = sr.model_dump(mode="json")
         restored = SessionRecord.model_validate(data)
         assert restored.session_id == "ses-abc"
+        assert restored.agent == "omp"
         assert restored.last_seen_comment_id == "cmt-42"
+
+    def test_legacy_record_without_agent_defaults_to_none(self) -> None:
+        sr = SessionRecord.model_validate(
+            {"session_id": "ses-abc", "last_seen_comment_id": "cmt-42"}
+        )
+        assert sr.agent is None
 
     def test_null_last_seen_roundtrip(self) -> None:
         sr = SessionRecord(session_id="ses-abc", last_seen_comment_id=None)
@@ -431,6 +446,7 @@ class TestBackwardCompat:
         mgr = StateManager(path)
         store = mgr.load()
         assert len(store.tickets) == 1
+        assert store.tickets[0].agent is None
         assert store.tickets[0].attachment_count == 0
 
     def test_attachment_count_roundtrips_through_save_load(

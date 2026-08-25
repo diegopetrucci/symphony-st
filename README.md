@@ -5,7 +5,8 @@ AI coding agents. Label a ticket (or toggle a project field), walk away,
 and read the agent's reply when you have a moment; when you reply, the agent
 picks the thread back up. It runs as a single daemon on your own machine,
 clones each ticket's repo into its own sandbox, hands the work to
-[OpenCode](https://opencode.ai/), and posts the result back as a comment.
+[OpenCode](https://opencode.ai/) by default (or OMP if selected), and posts
+the result back as a comment.
 Several tickets can be in flight at once, so you can keep planning while the
 agents type.
 
@@ -21,8 +22,8 @@ tracker is the UI.
 
 ## Quickstart
 
-You need Python 3.11+, `git`, `bwrap` (bubblewrap), and OpenCode installed and
-authenticated. Then:
+You need Python 3.11+, `git`, `bwrap` (bubblewrap), and OpenCode (the default)
+or OMP installed and authenticated. Then:
 
 ```bash
 # 1. Install
@@ -103,10 +104,11 @@ These are not Python packages and won't be installed for you:
   or `pacman -S bubblewrap`.
 - **git**, configured well enough to clone the repos you want the agent to
   work on.
-- **OpenCode**, installed and authenticated. The daemon invokes `opencode`
-  inside the sandbox; whatever is on the daemon's `$PATH` is visible to the
-  agent. Set `SYMPHONY_SANDBOX_PATH` if the daemon runs with a stripped
-  `$PATH`, for example under `systemd`.
+- **OpenCode** (the default) or **OMP**, installed and authenticated. The
+  daemon invokes the selected `opencode` or `omp` binary inside the sandbox;
+  it must be on the sandbox's `$PATH`. By default the sandbox uses the
+  daemon's `$PATH`; set `SYMPHONY_SANDBOX_PATH` to use a different one, for
+  example under `systemd`.
 
 ## Linear setup
 
@@ -284,6 +286,21 @@ You can omit the credential entirely and let the daemon read the
 appropriate environment variable (`LINEAR_API_KEY` or `GITHUB_TOKEN`)
 directly; that is often nicer for systemd or secret managers.
 
+### Coding agent
+
+The optional top-level `agent` key selects the coding-agent CLI for the
+daemon. It accepts `opencode` (the default) or `omp`:
+
+```yaml
+agent: omp
+```
+
+The selected binary must be on the sandbox's `$PATH`. The sandbox uses
+`SYMPHONY_SANDBOX_PATH` when it is set, otherwise it uses the daemon's
+`$PATH`. Agents do not share sessions: changing `agent` makes a ticket with a
+session from the other agent start a fresh session on its next turn instead of
+resuming the old one.
+
 ### Full annotated config
 
 The annotated config below shows the Linear backend. For the GitHub
@@ -292,6 +309,9 @@ documented there side by side.
 
 ```yaml
 # config.yaml (placed in the workspace directory)
+
+# Coding-agent CLI to run (default: opencode). Must be `opencode` or `omp`.
+agent: opencode
 
 # Choose exactly one backend — linear or github.
 linear:
@@ -373,9 +393,9 @@ A copy of this example lives at `config.yaml.example` in the repo root.
 ### Per-issue model override
 
 A `Model: <value>` label on an issue picks the model for that ticket's
-primary agent. The daemon passes `--model` to `opencode run` on every turn
-for that ticket, first turn and resumes alike. Subagents keep their own
-models.
+primary agent. The daemon passes `--model` to the selected coding agent on
+every turn for that ticket, first turn and resumes alike. Subagents keep their
+own models.
 
 The value is looked up case-insensitively in the top-level `models` map:
 
@@ -402,8 +422,8 @@ so create them yourself.
 Nothing is persisted. Change the label and the next turn uses the new model;
 remove it and the agent's own model applies again. The final comment names
 the model when one was resolved. Model ids are not validated: a bad value
-makes OpenCode exit at once, and the ticket lands in Needs Input with the
-error.
+makes the selected agent exit at once, and the ticket lands in Needs Input
+with the error.
 
 ### Webhook (optional)
 
@@ -455,10 +475,14 @@ WorkingDirectory=%h/symphony
 # value).
 Environment=LINEAR_API_KEY=lin_api_...
 # Environment=GITHUB_TOKEN=ghp_...
-# systemd strips PATH; tell the sandbox where to find opencode, git, bwrap,
-# and anything your .symphony/setup script calls. Include %h/.local/bin if
-# your setup script uses tools installed there, such as uv or uvx.
+# systemd strips PATH. SYMPHONY_SANDBOX_PATH tells the sandbox (and startup
+# validation) where to find the selected coding agent and anything your
+# .symphony/setup script calls. Include %h/.local/bin if your setup script uses
+# tools installed there, such as uv or uvx.
 Environment=SYMPHONY_SANDBOX_PATH=%h/.local/bin:%h/.opencode/bin:/usr/local/bin:/usr/bin:/bin
+# The daemon itself runs bwrap and git outside the sandbox, so those must be on
+# the daemon's own PATH. Add a plain Environment=PATH= line if they live
+# somewhere systemd's default does not cover.
 # Point at your SSH agent, or every clone of a private repo over SSH fails
 # with "Permission denied (publickey)". A systemd unit inherits nothing from
 # your shell. Use %t/gcr/ssh for gnome-keyring, %t/openssh_agent for a plain
@@ -477,14 +501,16 @@ Two variables in that sample cause most deployment failures, because both
 work by accident when you launch Symphony from a terminal and stop working
 under systemd:
 
-- `SYMPHONY_SANDBOX_PATH` is the `PATH` inside the sandbox. If it omits a
-  directory that `.symphony/setup` needs, the setup step exits with code 127
-  and a `command not found` message.
+- `SYMPHONY_SANDBOX_PATH` is the `PATH` inside the sandbox, and the one the
+  startup check searches for the selected coding agent. If it omits that agent,
+  the daemon refuses to start. If it omits a directory that `.symphony/setup`
+  needs, the setup step exits with code 127 and a `command not found` message.
+  It does not affect `bwrap` or `git`, which the daemon runs outside the
+  sandbox using its own `PATH`.
 - `SSH_AUTH_SOCK` is needed because Symphony clones project repos outside
   the sandbox with your credentials.
 
-The daemon starts cleanly in both cases; the failure appears later, on the
-first ticket.
+Other setup and SSH-agent failures appear later, on the first ticket.
 
 By default the unit starts when you log in. To start it at boot instead,
 run `loginctl enable-linger $USER`. Note that a lingering service starts
@@ -524,15 +550,15 @@ active workflow states. New tickets enter the **initial pipeline**:
    `auto_branch: false` is set, the workspace stays on whatever `git clone`
    produced (typically the remote default branch).
 4. Run `.symphony/setup` inside the sandbox, if your repo has one.
-5. Launch `opencode run` inside the sandbox with the ticket's title and
-   description as the prompt.
+5. Launch the configured coding agent inside the sandbox with the ticket's
+   title and description as the prompt.
 6. Post the agent's final message as a comment, plus a small metadata
-   comment with the workspace path and OpenCode session id.
+   comment with the workspace path and agent session id.
 7. Transition the ticket to the configured needs-input state.
 
 Tickets you've already replied to enter the **resume pipeline** instead:
-the daemon picks up the new human comments, runs `opencode run --session
-<id>`, and posts the result.
+the daemon picks up the new human comments, resumes the configured agent's
+session, and posts the result.
 
 Up to five turns run in parallel across different tickets, with per-ticket
 serialisation so a single ticket never has two turns in flight. The agent
@@ -541,13 +567,14 @@ other channel.
 
 ### Sandbox
 
-Each OpenCode turn runs inside a bubblewrap sandbox. The ticket's workspace
+Each coding-agent turn runs inside a bubblewrap sandbox. The ticket's workspace
 is mounted read-write; the rest of the host root is read-only. Credential
 directories such as `~/.ssh`, `~/.gnupg`, `~/.aws`, the Docker socket and a
 handful of others are concealed by overlaying empty tmpfs or `/dev/null`.
 The network namespace is shared so the agent can reach the internet, but
-user, PID, IPC and UTS namespaces are isolated. Environment is wiped down
-to `HOME` plus an inherited `PATH` (or `SYMPHONY_SANDBOX_PATH` if set).
+user, PID, IPC and UTS namespaces are isolated. Environment is wiped down;
+its `PATH` comes from a caller-supplied value when present, otherwise from
+`SYMPHONY_SANDBOX_PATH` or the daemon's `PATH`.
 
 `/tmp` inside the sandbox is not the host's shared `/tmp`: it is bound to
 the ticket's own `tmp/` directory on disk, so scratch files are per-ticket,
@@ -634,10 +661,13 @@ this shape:
 The workspace path is where the repo was cloned (Linear tickets use the
 team key + number like `TEAM-42`; GitHub issues use
 `<owner>-<repo>-<number>`; the clone itself lives in the `repo/`
-subdirectory of the ticket's directory). The session id is the OpenCode
-session you can resume manually.
+subdirectory of the ticket's directory). The session id belongs to the
+configured coding agent. Sessions are keyed by the workspace path, so moving
+the repo path prevents either agent from resuming its session.
 
 ### Resume a session by hand
+
+For an OpenCode session:
 
 ```bash
 cd <workspace>/TEAM-42/repo
@@ -646,7 +676,10 @@ opencode run --session ses_abc123 -- "Hello, what's the status?"
 
 OpenCode session state lives under `~/.opencode/` and
 `~/.local/share/opencode/`. These are bind-mounted into the sandbox so
-session resumes work both from inside the daemon and from your shell.
+session resumes work both from inside the daemon and from your shell. OMP
+sessions live under `~/.omp/agent/sessions/<slugified-cwd>/`; use OMP's resume
+command from the same workspace path. `~/.omp` is likewise bind-mounted into
+the sandbox for OMP's session, authentication, and run state.
 
 ### Check daemon state
 
@@ -692,8 +725,8 @@ uv sync
 ```
 
 Integration tests shell out to `bwrap` and `git` but never to the real
-`opencode` binary or any LLM. See `AGENTS.md` for an orientation to the
-codebase.
+`opencode` or `omp` binary or any LLM. See `AGENTS.md` for an orientation to
+the codebase.
 
 ## License
 

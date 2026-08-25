@@ -20,7 +20,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from symphony_linear import agent_runner
 from symphony_linear.opencode import (
+    OpenCodeCancelled,
     OpenCodeError,
     OpenCodeTimeout,
     _assemble_final_reply,
@@ -397,7 +399,7 @@ class TestAssembleFinalReply:
         ]
         stdout = "\n".join(json.dumps(e) for e in events).encode()
         proc = _FakePopen(stdout=stdout, exit_code=0)
-        with patch("symphony_linear.opencode.run_in_sandbox", return_value=proc):
+        with patch("symphony_linear.agent_runner.run_in_sandbox", return_value=proc):
             session_id, final_message, _ = run_initial(
                 workspace_path="/ws",
                 tmp_path="/ws/tmp",
@@ -562,7 +564,7 @@ class TestExecuteTimeout:
         idle_timeout_seconds: int = 100,
     ) -> OpenCodeTimeout:
         """Run run_initial against *proc* and return the raised timeout."""
-        with patch("symphony_linear.opencode.run_in_sandbox", return_value=proc):
+        with patch("symphony_linear.agent_runner.run_in_sandbox", return_value=proc):
             with pytest.raises(OpenCodeTimeout) as excinfo:
                 run_initial(
                     workspace_path="/ws",
@@ -739,7 +741,7 @@ class TestExecuteTimeout:
         ]
         stdout = "\n".join(json.dumps(e) for e in events).encode()
         proc = _FakePopen(stdout=stdout, exit_code=0)
-        with patch("symphony_linear.opencode.run_in_sandbox", return_value=proc):
+        with patch("symphony_linear.agent_runner.run_in_sandbox", return_value=proc):
             session_id, final_message, _ = run_initial(
                 workspace_path="/ws",
                 tmp_path="/ws/tmp",
@@ -776,7 +778,7 @@ class TestExecuteTimeout:
 
         threading.Thread(target=exit_soon, daemon=True).start()
         started = time.monotonic()
-        with patch("symphony_linear.opencode.run_in_sandbox", return_value=proc):
+        with patch("symphony_linear.agent_runner.run_in_sandbox", return_value=proc):
             session_id, final_message, _ = run_initial(
                 workspace_path="/ws",
                 tmp_path="/ws/tmp",
@@ -799,7 +801,7 @@ class TestExecuteExitErrors:
     @staticmethod
     def _run_initial(proc: "_FakePopen") -> OpenCodeError:
         """Run run_initial against *proc* and return the raised error."""
-        with patch("symphony_linear.opencode.run_in_sandbox", return_value=proc):
+        with patch("symphony_linear.agent_runner.run_in_sandbox", return_value=proc):
             with pytest.raises(OpenCodeError) as excinfo:
                 run_initial(
                     workspace_path="/ws",
@@ -831,9 +833,29 @@ class TestExecuteExitErrors:
         assert "AI_APICallError: Overloaded" in msg
         assert "loading path" not in msg
 
+    def test_signal_exit_raises_open_code_cancelled(self) -> None:
+        """A negative return code remains distinct from an agent failure."""
+        proc = _FakePopen(exit_code=-9)
+        with patch("symphony_linear.agent_runner.run_in_sandbox", return_value=proc):
+            with pytest.raises(OpenCodeCancelled, match="killed by signal 9"):
+                run_initial(
+                    workspace_path="/ws",
+                    tmp_path="/ws/tmp",
+                    prompt="do it",
+                    timeout_seconds=10,
+                    idle_timeout_seconds=10,
+                    on_subprocess=lambda p: None,
+                )
+
 
 class TestOpenCodeTimeoutAttributes:
     """Verify OpenCodeTimeout carries partial_message, session_id, and reason."""
+
+    def test_legacy_exceptions_alias_agent_runner_exceptions(self) -> None:
+        """Orchestrator-facing OpenCode exception names remain compatible."""
+        assert OpenCodeError is agent_runner.AgentError
+        assert OpenCodeTimeout is agent_runner.AgentTimeout
+        assert OpenCodeCancelled is agent_runner.AgentCancelled
 
     def test_timeout_with_partial_output(self) -> None:
         """Full partial output is captured as attributes."""
@@ -900,7 +922,7 @@ class TestPrintLogsFlag:
     def test_run_initial_has_print_logs(self) -> None:
         fake_proc = self._make_fake_popen()
         with patch(
-            "symphony_linear.opencode.run_in_sandbox", return_value=fake_proc
+            "symphony_linear.agent_runner.run_in_sandbox", return_value=fake_proc
         ) as mock_sandbox:
             run_initial(
                 workspace_path="/ws",
@@ -916,7 +938,7 @@ class TestPrintLogsFlag:
     def test_run_resume_has_print_logs(self) -> None:
         fake_proc = self._make_fake_popen()
         with patch(
-            "symphony_linear.opencode.run_in_sandbox", return_value=fake_proc
+            "symphony_linear.agent_runner.run_in_sandbox", return_value=fake_proc
         ) as mock_sandbox:
             run_resume(
                 workspace_path="/ws",
@@ -940,7 +962,7 @@ class TestPrintLogsFlag:
         proc = _FakePopen(
             stdout=stdout, stderr=b"[log] 12:00:00 something\n", exit_code=0
         )
-        with patch("symphony_linear.opencode.run_in_sandbox", return_value=proc):
+        with patch("symphony_linear.agent_runner.run_in_sandbox", return_value=proc):
             session_id, final_message, _ = run_initial(
                 workspace_path="/ws",
                 tmp_path="/ws/tmp",
@@ -975,7 +997,7 @@ class TestFilesArgv:
         """When files is None, no --file flags appear."""
         fake_proc = self._make_fake_popen()
         with patch(
-            "symphony_linear.opencode.run_in_sandbox", return_value=fake_proc
+            "symphony_linear.agent_runner.run_in_sandbox", return_value=fake_proc
         ) as mock_sandbox:
             run_initial(
                 workspace_path="/ws",
@@ -992,7 +1014,7 @@ class TestFilesArgv:
         """When files is an empty list, no --file flags appear."""
         fake_proc = self._make_fake_popen()
         with patch(
-            "symphony_linear.opencode.run_in_sandbox", return_value=fake_proc
+            "symphony_linear.agent_runner.run_in_sandbox", return_value=fake_proc
         ) as mock_sandbox:
             run_initial(
                 workspace_path="/ws",
@@ -1010,7 +1032,7 @@ class TestFilesArgv:
         """A single file emits one --file <path> pair."""
         fake_proc = self._make_fake_popen()
         with patch(
-            "symphony_linear.opencode.run_in_sandbox", return_value=fake_proc
+            "symphony_linear.agent_runner.run_in_sandbox", return_value=fake_proc
         ) as mock_sandbox:
             run_initial(
                 workspace_path="/ws",
@@ -1029,7 +1051,7 @@ class TestFilesArgv:
         """Multiple files emit --file pairs in order."""
         fake_proc = self._make_fake_popen()
         with patch(
-            "symphony_linear.opencode.run_in_sandbox", return_value=fake_proc
+            "symphony_linear.agent_runner.run_in_sandbox", return_value=fake_proc
         ) as mock_sandbox:
             run_initial(
                 workspace_path="/ws",
@@ -1051,7 +1073,7 @@ class TestFilesArgv:
         """--file flags appear before the -- separator."""
         fake_proc = self._make_fake_popen()
         with patch(
-            "symphony_linear.opencode.run_in_sandbox", return_value=fake_proc
+            "symphony_linear.agent_runner.run_in_sandbox", return_value=fake_proc
         ) as mock_sandbox:
             run_initial(
                 workspace_path="/ws",
@@ -1071,7 +1093,7 @@ class TestFilesArgv:
         """When files is None, no --file flags appear in resume."""
         fake_proc = self._make_fake_popen()
         with patch(
-            "symphony_linear.opencode.run_in_sandbox", return_value=fake_proc
+            "symphony_linear.agent_runner.run_in_sandbox", return_value=fake_proc
         ) as mock_sandbox:
             run_resume(
                 workspace_path="/ws",
@@ -1089,7 +1111,7 @@ class TestFilesArgv:
         """Files are emitted as --file pairs in the resume command."""
         fake_proc = self._make_fake_popen()
         with patch(
-            "symphony_linear.opencode.run_in_sandbox", return_value=fake_proc
+            "symphony_linear.agent_runner.run_in_sandbox", return_value=fake_proc
         ) as mock_sandbox:
             run_resume(
                 workspace_path="/ws",
@@ -1113,7 +1135,7 @@ class TestFilesArgv:
         """--file appears before -- in resume command."""
         fake_proc = self._make_fake_popen()
         with patch(
-            "symphony_linear.opencode.run_in_sandbox", return_value=fake_proc
+            "symphony_linear.agent_runner.run_in_sandbox", return_value=fake_proc
         ) as mock_sandbox:
             run_resume(
                 workspace_path="/ws",
@@ -1153,7 +1175,7 @@ class TestModelFlag:
     def test_run_initial_with_model(self) -> None:
         fake_proc = self._make_fake_popen()
         with patch(
-            "symphony_linear.opencode.run_in_sandbox", return_value=fake_proc
+            "symphony_linear.agent_runner.run_in_sandbox", return_value=fake_proc
         ) as mock_sandbox:
             run_initial(
                 workspace_path="/ws",
@@ -1172,7 +1194,7 @@ class TestModelFlag:
     def test_run_initial_without_model(self) -> None:
         fake_proc = self._make_fake_popen()
         with patch(
-            "symphony_linear.opencode.run_in_sandbox", return_value=fake_proc
+            "symphony_linear.agent_runner.run_in_sandbox", return_value=fake_proc
         ) as mock_sandbox:
             run_initial(
                 workspace_path="/ws",
@@ -1188,7 +1210,7 @@ class TestModelFlag:
     def test_run_resume_with_model(self) -> None:
         fake_proc = self._make_fake_popen()
         with patch(
-            "symphony_linear.opencode.run_in_sandbox", return_value=fake_proc
+            "symphony_linear.agent_runner.run_in_sandbox", return_value=fake_proc
         ) as mock_sandbox:
             run_resume(
                 workspace_path="/ws",
@@ -1208,7 +1230,7 @@ class TestModelFlag:
     def test_run_resume_without_model(self) -> None:
         fake_proc = self._make_fake_popen()
         with patch(
-            "symphony_linear.opencode.run_in_sandbox", return_value=fake_proc
+            "symphony_linear.agent_runner.run_in_sandbox", return_value=fake_proc
         ) as mock_sandbox:
             run_resume(
                 workspace_path="/ws",
@@ -1266,7 +1288,7 @@ class TestTmpPathForwarded:
     def test_run_initial_forwards_tmp_path(self) -> None:
         fake_proc = self._make_fake_popen()
         with patch(
-            "symphony_linear.opencode.run_in_sandbox", return_value=fake_proc
+            "symphony_linear.agent_runner.run_in_sandbox", return_value=fake_proc
         ) as mock_sandbox:
             run_initial(
                 workspace_path="/ws",
@@ -1281,7 +1303,7 @@ class TestTmpPathForwarded:
     def test_run_resume_forwards_tmp_path(self) -> None:
         fake_proc = self._make_fake_popen()
         with patch(
-            "symphony_linear.opencode.run_in_sandbox", return_value=fake_proc
+            "symphony_linear.agent_runner.run_in_sandbox", return_value=fake_proc
         ) as mock_sandbox:
             run_resume(
                 workspace_path="/ws",
@@ -1331,7 +1353,7 @@ class TestOpenCodePermissionEnv:
     def test_run_initial_injects_open_code_permission(self) -> None:
         fake_proc = self._make_fake_popen()
         with patch(
-            "symphony_linear.opencode.run_in_sandbox", return_value=fake_proc
+            "symphony_linear.agent_runner.run_in_sandbox", return_value=fake_proc
         ) as mock_sandbox:
             run_initial(
                 workspace_path="/ws",
@@ -1346,7 +1368,7 @@ class TestOpenCodePermissionEnv:
     def test_run_resume_injects_open_code_permission(self) -> None:
         fake_proc = self._make_fake_popen()
         with patch(
-            "symphony_linear.opencode.run_in_sandbox", return_value=fake_proc
+            "symphony_linear.agent_runner.run_in_sandbox", return_value=fake_proc
         ) as mock_sandbox:
             run_resume(
                 workspace_path="/ws",

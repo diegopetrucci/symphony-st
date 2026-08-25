@@ -270,6 +270,7 @@ class TestNewTicketPipeline:
         assert ts is not None
         assert ts.status == TicketStatus.needs_input
         assert ts.session_id == "ses-abc"
+        assert ts.agent == "opencode"
         assert ts.last_seen_comment_id is not None
         assert ts.metadata_comment_id is not None
 
@@ -286,6 +287,36 @@ class TestNewTicketPipeline:
         _, kw = mock_finalize.call_args
         assert kw.get("on_subprocess") is not None
         assert kw.get("auto_branch") is True  # global default
+
+    def test_omp_dispatches_initial_and_tags_session(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        orchestrator._config.agent = "omp"
+        with (
+            mock.patch("symphony_linear.orchestrator.clone_workspace") as mock_clone,
+            mock.patch(
+                "symphony_linear.orchestrator.finalize_workspace"
+            ) as mock_finalize,
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config"
+            ) as mock_load_config,
+            mock.patch("symphony_linear.orchestrator.run_initial") as mock_opencode,
+            mock.patch("symphony_linear.orchestrator.omp.run_initial") as mock_omp,
+        ):
+            issue = self._setup_mocks(
+                mock_clone,
+                mock_finalize,
+                mock_load_config,
+                mock_omp,
+                linear,
+            )
+            orchestrator._new_ticket_pipeline(issue)
+
+        mock_opencode.assert_not_called()
+        mock_omp.assert_called_once()
+        ticket_state = orchestrator._state.get("ticket-1")
+        assert ticket_state is not None
+        assert ticket_state.agent == "omp"
 
     def test_turn_input_marker_set_to_baseline(
         self, orchestrator: Orchestrator, linear: FakeLinearClient
@@ -501,6 +532,7 @@ class TestNewTicketPipeline:
         assert ts.status == TicketStatus.failed
         assert ts.last_seen_comment_id is not None  # B1
         assert ts.session_id is None  # no session in timeout exception
+        assert ts.agent is None
 
     def test_opencode_timeout_persists_salvaged_session_id(
         self, orchestrator: Orchestrator, linear: FakeLinearClient
@@ -544,6 +576,7 @@ class TestNewTicketPipeline:
         assert ts is not None
         assert ts.status == TicketStatus.failed
         assert ts.session_id == "ses_salvaged"
+        assert ts.agent == "opencode"
 
     def test_opencode_timeout_comment_includes_partial_output(
         self, orchestrator: Orchestrator, linear: FakeLinearClient
@@ -1535,6 +1568,7 @@ class TestNewTicketRehydrate:
         assert ts is not None
         assert ts.status == TicketStatus.needs_input
         assert ts.session_id == "ses-rehydrated"
+        assert ts.agent == "opencode"
         assert ts.last_seen_comment_id == "cmt-prior"
         assert ts.workspace_path == "/tmp/ws/TEAM-1"
 
@@ -1594,6 +1628,58 @@ class TestNewTicketRehydrate:
         assert ts is not None
         assert ts.session_id == "ses-fresh"
         assert ts.status == TicketStatus.needs_input
+
+    def test_rehydrate_discards_session_from_other_agent(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """A durable session from another agent starts a fresh matching session."""
+        from symphony_linear.state import SessionRecord
+
+        orchestrator._config.agent = "omp"
+        orchestrator._state.set_session(
+            "ticket-1",
+            SessionRecord(
+                session_id="ses-opencode",
+                agent="opencode",
+                last_seen_comment_id="cmt-prior",
+            ),
+        )
+        linear.set_response(
+            "get_project",
+            Project(
+                id="proj-1",
+                name="Test",
+                links=[
+                    ProjectLink(label="Repo", url="https://github.com/org/repo.git")
+                ],
+            ),
+        )
+        linear.set_response("get_issue", _make_issue(description="Fix"))
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.clone_workspace",
+                return_value=("/tmp/ws/TEAM-1", False),
+            ),
+            mock.patch("symphony_linear.orchestrator.finalize_workspace"),
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config",
+                return_value=ProjectConfig(),
+            ),
+            mock.patch("symphony_linear.orchestrator.run_initial") as mock_opencode,
+            mock.patch(
+                "symphony_linear.orchestrator.omp.run_initial",
+                return_value=("omp-session", "Done.", None),
+            ) as mock_omp,
+        ):
+            orchestrator._new_ticket_pipeline(_make_issue())
+
+        mock_opencode.assert_not_called()
+        mock_omp.assert_called_once()
+        ticket_state = orchestrator._state.get("ticket-1")
+        assert ticket_state is not None
+        assert ticket_state.session_id == "omp-session"
+        assert ticket_state.agent == "omp"
+        assert orchestrator._state.get_session("ticket-1") is None
 
     def test_rehydrate_transition_failure_does_not_crash(
         self, orchestrator: Orchestrator, linear: FakeLinearClient
@@ -1954,6 +2040,82 @@ class TestResumePipeline:
             orchestrator._resume_pipeline(ts)
         updated = orchestrator._state.get("ticket-1")
         assert updated is not None and updated.status == TicketStatus.needs_input
+
+    def test_omp_dispatches_resume(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        orchestrator._config.agent = "omp"
+        ts = self._make_ts(agent="omp")
+        orchestrator._state.upsert(ts)
+        linear.set_response("list_comments_since", [_make_comment("c1", "Fix please")])
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config",
+                return_value=ProjectConfig(),
+            ),
+            mock.patch("symphony_linear.orchestrator.run_resume") as mock_opencode,
+            mock.patch(
+                "symphony_linear.orchestrator.omp.run_resume",
+                return_value=("Done!", None),
+            ) as mock_omp,
+        ):
+            orchestrator._resume_pipeline(ts)
+
+        mock_opencode.assert_not_called()
+        mock_omp.assert_called_once()
+
+    def test_agent_mismatch_starts_initial_pipeline(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """A comment after an agent switch starts a fresh session, not a resume."""
+        from symphony_linear.state import SessionRecord
+
+        orchestrator._config.agent = "omp"
+        ts = self._make_ts(agent="opencode")
+        orchestrator._state.upsert(ts)
+        orchestrator._state.set_session(
+            "ticket-1", SessionRecord(session_id="ses-opencode", agent="opencode")
+        )
+        linear.set_response("list_comments_since", [_make_comment("c1", "Fix please")])
+        linear.set_response("get_issue", _make_issue(description="Fix the bug"))
+        linear.set_response(
+            "get_project",
+            Project(
+                id="proj-1",
+                name="Test",
+                links=[
+                    ProjectLink(label="Repo", url="https://github.com/org/repo.git")
+                ],
+            ),
+        )
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.clone_workspace",
+                return_value=("/tmp/ws/TEAM-1", False),
+            ),
+            mock.patch("symphony_linear.orchestrator.finalize_workspace"),
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config",
+                return_value=ProjectConfig(),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.omp.run_initial",
+                return_value=("omp-session", "Done.", None),
+            ) as mock_initial,
+            mock.patch("symphony_linear.orchestrator.omp.run_resume") as mock_resume,
+        ):
+            orchestrator._resume_pipeline(ts)
+
+        mock_resume.assert_not_called()
+        mock_initial.assert_called_once()
+        prompt = mock_initial.call_args.kwargs["prompt"]
+        assert "Fix the bug" in prompt
+        assert "Fix please" in prompt
+        ticket_state = orchestrator._state.get("ticket-1")
+        assert ticket_state is not None
+        assert ticket_state.session_id == "omp-session"
+        assert ticket_state.agent == "omp"
+        assert orchestrator._state.get_session("ticket-1") is None
 
     def test_resume_turn_clears_cleanup_refused_state(
         self, orchestrator: Orchestrator, linear: FakeLinearClient
@@ -4023,6 +4185,7 @@ class TestTick:
         sr = orchestrator._state.get_session("ticket-1")
         assert sr is not None
         assert sr.session_id == "ses-abc"
+        assert sr.agent == "opencode"
         assert sr.last_seen_comment_id == "cmt-42"
 
     def test_cleanup_no_session_does_not_snapshot(
@@ -4886,6 +5049,37 @@ class TestRerunInterruptedTurn:
         posted = [b for _, b in linear.calls.get("post_comment", [])]
         assert any("starting it again" in b and "attempt 1 of 3" in b for b in posted)
         assert not any("Reply to continue" in b for b in posted)
+
+    def test_agent_mismatch_reruns_initial_during_recovery(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """Restart recovery must not hand a stale session to the new agent."""
+        from symphony_linear.state import SessionRecord
+
+        orchestrator._config.agent = "omp"
+        ticket_state = self._add_working(orchestrator, agent="opencode")
+        orchestrator._state.set_session(
+            "ticket-1", SessionRecord(session_id="ses-abc", agent="opencode")
+        )
+        issue = _make_issue()
+        pending_comment = _make_comment("cmt-new", "please continue")
+        linear.set_response("list_comments_since", [pending_comment])
+        with (
+            mock.patch.object(orchestrator, "_resume_pipeline") as mock_resume,
+            mock.patch.object(orchestrator, "_new_ticket_pipeline") as mock_initial,
+        ):
+            orchestrator._rerun_interrupted_turn(ticket_state, issue)
+
+        mock_resume.assert_not_called()
+        mock_initial.assert_called_once_with(
+            issue,
+            _format_comments_message([pending_comment]),
+            recovering=True,
+        )
+        assert ticket_state.session_id is None
+        assert ticket_state.agent is None
+        assert ticket_state.interrupted_turns == 1
+        assert orchestrator._state.get_session("ticket-1") is None
 
     def test_nothing_to_replay_parks(
         self, orchestrator: Orchestrator, linear: FakeLinearClient

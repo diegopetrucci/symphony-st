@@ -73,9 +73,23 @@ linear:
 #   # the daemon user's identity.
 #   # clone_protocol: ssh
 
+# ---------------------------------------------------------------------------
+# Coding agent
+# ---------------------------------------------------------------------------
+
+# Which coding-agent CLI the daemon launches (default: opencode).
+# One of `opencode` or `omp`.  Global for the whole daemon — there is no
+# per-project or per-issue override.  The binary must be on the sandbox
+# PATH (see SYMPHONY_SANDBOX_PATH); the daemon refuses to start otherwise.
+# The two agents do not share sessions: changing this value makes a ticket
+# holding a session from the other agent start a fresh session on its next
+# turn, losing that ticket's conversation history.
+agent: opencode
+
 # Optional. Per-issue model overrides for the primary agent.  A
 # `Model: <value>` label on an issue runs that issue's turns with
-# `opencode run --model <resolved>`, first turn and resumes alike.  The
+# `--model <resolved>` passed to the selected agent, first turn and
+# resumes alike.  The
 # value is looked up case-insensitively here; a value that is not in the
 # map is used verbatim, so a raw provider/model id (e.g.
 # `Model: anthropic/claude-sonnet-4-6`) works with no config change.

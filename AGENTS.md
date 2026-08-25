@@ -6,23 +6,24 @@ Orientation for AI agents working on this repo. Pair this with `README.md`
 ## What this is
 
 `symphony-linear` is a single-process Python daemon that orchestrates AI work on
-Linear or GitHub issues (one backend per daemon instance). The loop:
+Linear or GitHub issues (one tracker backend and coding-agent CLI per daemon
+instance). The loop:
 
 1. Poll the tracker for issues with the trigger signal (label or project
    field, depending on backend).
 2. For each new issue: clone the project's repo into a per-ticket workspace,
    switch to the ticket branch, optionally run `.symphony/setup`, then run
-   `opencode run` inside a bubblewrap sandbox with the ticket title +
-   description as the prompt.
+   the configured coding-agent CLI inside a bubblewrap sandbox with the ticket
+   title + description as the prompt.
 3. Post the AI's final message as a comment and transition the ticket
    to the configured "needs input" state.
-4. When a human comments, resume the OpenCode session with the new comment as
-   user input, post the result, repeat.
+4. When a human comments, resume the coding-agent session with the new comment
+   as user input, post the result, repeat.
 
 There is no web UI, no API, no database. State lives in `state.json` in the
 workspace dir. The only external services are the issue tracker (Linear or
-GitHub, accessed via GraphQL) and OpenCode (launched as a subprocess inside
-`bwrap`).
+GitHub, accessed via GraphQL) and the selected coding agent (launched as a
+subprocess inside `bwrap`).
 
 ## Stack
 
@@ -31,12 +32,15 @@ GitHub, accessed via GraphQL) and OpenCode (launched as a subprocess inside
   `.venv/` — use `.venv/bin/python` and `.venv/bin/pytest` directly.
 - Runtime deps: `pyyaml`, `pydantic` v2, `httpx`.
 - Dev deps: `pytest`.
-- External binaries required at runtime: `bwrap`, `git`, `opencode`.
+- External binaries required at runtime: `bwrap`, `git`, and the selected
+  coding-agent CLI (`opencode` or `omp`).
 - CLI entry point: `symphony` → `symphony_linear.cli:main`.
 - Backends: the orchestrator talks to a `Tracker` protocol (see `tracker.py`).
   Concrete implementations exist for Linear (`linear_tracker.py`) and
   GitHub Projects v2 (`github_tracker.py`). Exactly one backend is active
   per daemon, selected at config time.
+- Coding-agent adapters: OpenCode (`opencode.py`) and OMP (`omp.py`). Exactly
+  one coding-agent CLI is active per daemon, selected at config time.
 
 ## Layout
 
@@ -51,12 +55,14 @@ symphony_linear/
   github.py         GitHub GraphQL client (httpx, sync); typed exceptions
   github_tracker.py GitHub Projects v2 backend adapter implementing the Tracker protocol
   sandbox.py        Single function: run_in_sandbox() → builds the bwrap argv and returns a Popen
-  opencode.py       run_initial / run_resume; parses OpenCode's NDJSON event stream
+  agent_runner.py   Shared sandbox process runner; drains pipes and enforces turn watchdogs
+  opencode.py       OpenCode adapter: run_initial / run_resume; parses OpenCode NDJSON
+  omp.py            OMP adapter: run_initial / run_resume; parses OMP NDJSON
   workspace.py      prepare() / remove(): clone, branch switch, .symphony/setup; path-containment check
   orchestrator.py   The brain: poll loop, per-ticket pipelines, ThreadPoolExecutor, cancellation
   webhook.py        Optional webhook receiver; wakes poll loop on Linear updates. Absent config means polling only.
   logging.py        stderr logging setup
-tests/              pytest, mostly unit with mocks; integration tests marked `integration` (shell out to `bwrap`/`git` — they never call the real `opencode` binary or any LLM)
+tests/              pytest, mostly unit with mocks; integration tests marked `integration` (shell out to `bwrap`/`git` — they never call the real `opencode` or `omp` binary or any LLM)
 ```
 
 The flow worth knowing: `orchestrator._tick()` is called every
@@ -127,8 +133,11 @@ shutting down, or the ticket is no longer triggered — see `_is_still_triggered
   `mkdir -p` of both sides happen in `workspace.ensure_dir_map` (bwrap cannot
   create mount points under the read-only root bind); `run_in_sandbox` only
   emits argv from the resolved pairs. Git ops run
-  *outside* the sandbox using the daemon's credentials; OpenCode and
-  `.symphony/setup` run *inside*.
+  *outside* the sandbox using the daemon's credentials; the selected coding
+  agent and `.symphony/setup` run *inside*. OpenCode's session directories
+  and OMP's `~/.omp` are deliberate read-write binds. OMP's auth vault and
+  run/daemons directory both live under `~/.omp`; `PI_CODING_AGENT_DIR` does
+  not redirect the run/ path.
 - **The OpenCode session id is captured from the first NDJSON event** that
   includes `sessionID`; that value is the main session and any event whose
   top-level `sessionID` differs is subagent chatter. The final assistant
@@ -139,20 +148,39 @@ shutting down, or the ticket is no longer triggered — see `_is_still_triggered
   path keeps the full `_assemble_message` trace — every `"text"` segment
   plus one `*tool title*` line per tool call — because it is the only
   diagnostic on a killed turn. Other event types are intentionally ignored.
+- **OMP namespaces sessions by cwd path**, under
+  `~/.omp/agent/sessions/<slugified-cwd>/`, exactly like OpenCode. Moving a
+  repo path therefore breaks resume for either agent; retain the per-ticket
+  workspace path across turns.
+- **OMP prompts are unconditionally prefixed with a newline.** Any message
+  argv beginning with `@` is an attachment, so OMP exits 1 with "File not
+  found" for ticket text that starts with `@developer`. The prefix is applied
+  in both paths even when the prompt already starts with a newline.
 - **`OPENCODE_PERMISSION` is injected into the sandbox env for every turn** to
   pre-answer the three permissions that default to `ask` (external_directory,
   doom_loop, read); do not delete it as redundant with
   `--dangerously-skip-permissions` — that flag auto-approves only top-level
   session events, so a subagent permission ask would hang the turn forever.
+- **OMP needs no `OPENCODE_PERMISSION` equivalent.** Its `--auto-approve`
+  setting lets a task-tool subagent run to completion; the OpenCode
+  subagent-permission hang does not reproduce.
 - **Turns have an idle watchdog on top of the absolute timeout.** `_execute`
   drains stdout/stderr with one thread per stream and kills the process when
   neither produced output for `turn_idle_timeout_seconds` (default 1200s) or
   after `turn_timeout_seconds` in total; the tracker comment says which limit
-  fired (`OpenCodeTimeout.reason`). Load-bearing: `--print-logs` in both
+  fired (`AgentTimeout.reason`). Load-bearing for OpenCode: `--print-logs` in both
   `run_initial` and `run_resume` mirrors OpenCode's internal log to stderr —
   the parent's NDJSON stdout is silent while a subagent task runs, so without
   the flag stdout alone is no liveness signal. Do not filter out the hourly
   `cleanup prune` log line; it resets the watchdog, and that is accepted.
+  OMP needs no `--print-logs` equivalent: it emits `tool_execution_update`
+  roughly once a second on the parent stream while a subagent runs, so stdout
+  alone is a real liveness signal.
+- **Sessions are tagged with the agent that created them.** `TicketState.agent`
+  and `SessionRecord.agent` persist the tag; `None` is a pre-change record and
+  reads as `opencode`. Because session IDs are adapter-specific, a mismatch
+  with the configured agent discards the live session and durable snapshot and
+  starts a fresh session rather than attempting a resume.
 - **Restart recovery re-runs the interrupted turn, capped.** When the daemon
   restarts (or a pipeline thread dies) mid-turn, the ticket stays in
   `TicketStatus.working` and tick step 4 calls `_rerun_interrupted_turn`,
@@ -250,8 +278,8 @@ shutting down, or the ticket is no longer triggered — see `_is_still_triggered
   turn from the freshly fetched issue's labels by `model_from_labels` in
   `tracker.py` (case-insensitive prefix match; value looked up in the
   top-level `models:` alias map case-insensitively, passed through verbatim
-  on a miss). The resolved id becomes `--model` on `opencode run` for the
-  primary agent's turns, initial and resume; subagents are unaffected.
+  on a miss). The resolved id becomes `--model` for the primary agent's turns,
+  initial and resume; subagents are unaffected.
   Nothing is persisted — changing or removing the label takes effect on
   the next turn. The final-comment footer kind appends
   `· model: <id>` when overridden (the middle dot is the U+00B7 footer
@@ -278,7 +306,7 @@ Tests heavily use `unittest.mock`. Look at `tests/test_orchestrator.py` for
 the patterns — fake `LinearClient`, mocked `run_initial`/`run_resume`,
 `tmp_path` fixtures for state files. Integration tests under the
 `integration` marker shell out to `bwrap` and `git`; they do **not** invoke
-the real `opencode` binary or any LLM. Don't add tests that do — they're
+  the real `opencode` or `omp` binary or any LLM. Don't add tests that do — they're
 flaky (model nondeterminism), costly (API calls), and exercise OpenCode's
 behaviour, not ours. The NDJSON parser is unit-tested against a fixture.
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 
 from pathlib import Path
@@ -14,6 +15,7 @@ from symphony_linear.linear import LinearClient
 from symphony_linear.linear_tracker import LinearTracker
 from symphony_linear.logging import get_logger, setup_logging
 from symphony_linear.orchestrator import Orchestrator
+from symphony_linear.sandbox_path import resolve_sandbox_path
 from symphony_linear.state import load_state
 from symphony_linear.tracker import Tracker, model_label_name
 from symphony_linear.webhook import WebhookServer
@@ -71,6 +73,17 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(1)
     except ValueError as exc:
         logger.error("Config error: %s", exc)
+        sys.exit(1)
+
+    sandbox_path = resolve_sandbox_path()
+    if shutil.which(config.agent, path=sandbox_path) is None:
+        logger.error(
+            "Configured agent binary %r was not found on sandbox PATH %r. "
+            "Install it there, set SYMPHONY_SANDBOX_PATH, or choose another "
+            "'agent' value in config.yaml.",
+            config.agent,
+            sandbox_path,
+        )
         sys.exit(1)
 
     if args.validate_config:

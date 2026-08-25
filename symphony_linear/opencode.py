@@ -130,44 +130,17 @@ Missing keys default to 0 (including the ``cache`` sub-dict).  If no
 ``step_finish`` event appeared in the stream, the context token count is
 ``None``.  Only the last ``step_finish`` event is used; sub-agent events
 are not distinguished.
-
--------------------------------------------------------------------------------
-Design notes
--------------------------------------------------------------------------------
-
-- Each call to ``run_initial`` or ``run_resume`` represents exactly one turn.
-- The process is launched via ``run_in_sandbox`` from ``symphony_linear.sandbox``.
-- The ``on_subprocess`` callback is invoked immediately after launch so the
-  orchestrator can register the Popen handle for kill-on-label-removal.
-- ``--print-logs`` is passed on every run: it mirrors OpenCode's internal log
-  (the same lines written to ~/.local/share/opencode/log/opencode.log) to
-  stderr for ALL sessions. This is load-bearing for the idle watchdog: while
-  a subagent task runs, the parent's NDJSON stdout is completely silent, so
-  stdout alone is not a liveness signal.
-- Timeout handling uses a two-tier watchdog in :func:`_execute`. Two daemon
-  threads drain stdout/stderr incrementally and record the last-activity
-  timestamp; the main loop kills the process when nothing has been written
-  for ``idle_timeout_seconds`` (idle stall) or after ``timeout_seconds`` in
-  total (absolute cap). Both raise ``OpenCodeTimeout``, with the ``reason``
-  attribute distinguishing the two. A hung OpenCode still emits an hourly
-  'cleanup prune' log line which resets the watchdog — accepted, and no
-  filter is applied to that message because it is an internal format.
-- If the process was killed by external signal (negative returncode), we raise
-  ``OpenCodeCancelled`` to distinguish external kills from failures.
 """
 
 from __future__ import annotations
 
-import io
 import json
 import logging
 import subprocess
-import threading
-import time
 from pathlib import Path
 from typing import Callable
 
-from symphony_linear.sandbox import run_in_sandbox
+from symphony_linear import agent_runner
 
 logger = logging.getLogger(__name__)
 
@@ -184,44 +157,18 @@ logger = logging.getLogger(__name__)
 # daemon's absolute timeout. '--dangerously-skip-permissions' is a hidden
 # alias of '--auto' implemented behind that same session-id filter, so it
 # does not help either. The sandbox uses --clearenv, so the variable only
-# reaches OpenCode because it is in the env dict passed to run_in_sandbox.
+# reaches OpenCode because this adapter passes it in the runner env dict.
 OPENCODE_PERMISSION = (
     '{"external_directory":"allow","doom_loop":"allow","read":"allow"}'
 )
 
 # ---------------------------------------------------------------------------
-# Typed exceptions
+# Typed exception aliases
 # ---------------------------------------------------------------------------
 
-
-class OpenCodeError(Exception):
-    """OpenCode process exited with a non-zero exit code."""
-
-
-class OpenCodeTimeout(Exception):
-    """OpenCode process timed out and was killed.
-
-    ``reason`` distinguishes the two failure modes: an idle stall
-    ("produced no output for Ns") versus the absolute cap
-    ("exceeded Ns in total"). Every production raise site sets it.
-    """
-
-    def __init__(
-        self,
-        message: str,
-        partial_message: str = "",
-        session_id: str | None = None,
-        *,
-        reason: str,
-    ) -> None:
-        super().__init__(message)
-        self.partial_message = partial_message
-        self.session_id = session_id
-        self.reason = reason
-
-
-class OpenCodeCancelled(Exception):
-    """OpenCode process was killed externally (e.g. label removed)."""
+OpenCodeError = agent_runner.AgentError
+OpenCodeTimeout = agent_runner.AgentTimeout
+OpenCodeCancelled = agent_runner.AgentCancelled
 
 
 # ---------------------------------------------------------------------------
@@ -488,213 +435,85 @@ def _execute(
     attachments_path: str | None = None,
     dir_map: list[tuple[str, str]] | None = None,
 ) -> tuple[str, str, int | None]:
-    """Launch *cmd* inside the sandbox and parse the JSON event stream.
-
-    Runs a two-tier watchdog while the process is alive: one daemon thread
-    per stream drains stdout/stderr incrementally and records the last
-    activity timestamp; the main loop kills the process when nothing has been
-    written for ``idle_timeout_seconds`` (idle stall) or after
-    ``timeout_seconds`` in total (absolute cap). Both failure modes raise
-    :class:`OpenCodeTimeout` with a ``reason`` distinguishing them and with
-    best-effort salvaged partial output.
-
-    Returns ``(session_id, final_message, context_tokens)``.
-    """
-    home = str(Path.home())
-
-    proc = run_in_sandbox(
+    """Run an OpenCode command, then parse and validate its JSON event stream."""
+    returncode, stdout_text, stderr_text, timeout_reason = agent_runner.run(
         cmd=cmd,
         workspace_path=workspace_path,
         tmp_path=tmp_path,
-        hide_paths=hide_paths or [],
-        env={"HOME": home, "OPENCODE_PERMISSION": OPENCODE_PERMISSION},
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        timeout_seconds=timeout_seconds,
+        idle_timeout_seconds=idle_timeout_seconds,
+        on_subprocess=on_subprocess,
+        env={
+            "HOME": str(Path.home()),
+            "OPENCODE_PERMISSION": OPENCODE_PERMISSION,
+        },
+        hide_paths=hide_paths,
         extra_rw_paths=extra_rw_paths or [],
         attachments_path=attachments_path,
         dir_map=dir_map,
     )
 
-    # Let the caller register the Popen handle immediately.
-    on_subprocess(proc)
+    if timeout_reason is not None:
+        stderr_tail = agent_runner._tail(stderr_text)
+        # Best-effort salvage of partial output — must never mask the timeout.
+        try:
+            partial_session_id, partial_events = _parse_stream(stdout_text)
+            partial_message = _assemble_message(partial_events)
+        except Exception:
+            logger.debug("Failed to salvage partial output on timeout", exc_info=True)
+            partial_session_id = None
+            partial_message = ""
+        raise OpenCodeTimeout(
+            f"OpenCode turn timed out: {timeout_reason}\nstderr: {stderr_tail}",
+            partial_message=partial_message,
+            session_id=partial_session_id,
+            reason=timeout_reason,
+        )
 
-    assert proc.stdout is not None and proc.stderr is not None
+    # Raw OpenCode output; only useful when diagnosing parse/protocol issues.
+    logger.debug("=== raw OpenCode stdout ===\n%s\n=== end stdout ===", stdout_text)
+    if stderr_text:
+        logger.debug("=== raw OpenCode stderr ===\n%s\n=== end stderr ===", stderr_text)
 
-    stdout_chunks: list[bytes] = []
-    stderr_chunks: list[bytes] = []
-    activity_lock = threading.Lock()
-    last_activity = time.monotonic()
+    # ----------------------------------------------------------------------
+    # Parse NDJSON events (lenient — corrupt lines are skipped).
+    # ----------------------------------------------------------------------
+    session_id, parsed_events = _parse_stream(stdout_text)
 
-    def _drain(stream: io.BufferedReader, chunks: list[bytes]) -> None:
-        """Read *stream* until EOF in byte chunks, recording last-activity.
+    # ----------------------------------------------------------------------
+    # Extract context tokens from the last step_finish.
+    # ----------------------------------------------------------------------
+    context_tokens = _extract_context_tokens(parsed_events)
 
-        Chunks rather than lines: liveness must not depend on newline
-        framing. ``read1`` returns as soon as any byte is available, so a
-        process that writes slowly or without newlines still resets the
-        watchdog; ``read(n)`` would block until n bytes or EOF, which would
-        make a trickling stream look stalled.
-        """
-        nonlocal last_activity
-        while True:
-            chunk = stream.read1(65536)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            with activity_lock:
-                last_activity = time.monotonic()
-        stream.close()
+    # ----------------------------------------------------------------------
+    # Validate.
+    # ----------------------------------------------------------------------
+    # Detect external kill (negative returncode = killed by signal).
+    # Check this before non-zero exit so we can distinguish.
+    if returncode is not None and returncode < 0:
+        raise OpenCodeCancelled(f"OpenCode process killed by signal {-returncode}")
 
-    stdout_thread = threading.Thread(
-        target=_drain,
-        args=(proc.stdout, stdout_chunks),
-        name="opencode-stdout",
-        daemon=True,
-    )
-    stderr_thread = threading.Thread(
-        target=_drain,
-        args=(proc.stderr, stderr_chunks),
-        name="opencode-stderr",
-        daemon=True,
-    )
-    stdout_thread.start()
-    stderr_thread.start()
+    if returncode != 0:
+        raise OpenCodeError(
+            f"OpenCode exited with code {returncode}\nstderr: {stderr_text[-2000:]}"
+        )
 
-    start = time.monotonic()
-    timeout_reason: str | None = None
+    if session_id is None:
+        raise OpenCodeError(
+            "No session ID found in OpenCode JSON stream.\n"
+            f"stdout: {stdout_text[:2000]}\n"
+            f"stderr: {stderr_text[-2000:]}"
+        )
 
-    try:
-        # ------------------------------------------------------------------
-        # Watchdog loop: exit when the process dies, or kill it when either
-        # deadline fires.
-        # ------------------------------------------------------------------
-        while True:
-            if proc.poll() is not None:
-                break
-            with activity_lock:
-                elapsed_total = time.monotonic() - start
-                elapsed_idle = time.monotonic() - last_activity
-            if elapsed_total >= timeout_seconds:
-                timeout_reason = f"exceeded {timeout_seconds}s in total"
-                break
-            if elapsed_idle >= idle_timeout_seconds:
-                timeout_reason = f"produced no output for {elapsed_idle:.0f}s"
-                break
-            # Block until the process exits or the nearer of the two
-            # deadlines arrives: wait() returns as soon as the process dies,
-            # so a healthy turn is reaped promptly instead of being
-            # discovered only after the idle window expires. On deadline it
-            # raises TimeoutExpired and we re-evaluate both deadlines (fresh
-            # output from the drain threads may have pushed the idle one).
-            try:
-                proc.wait(
-                    timeout=max(
-                        0.0,
-                        min(
-                            timeout_seconds - elapsed_total,
-                            idle_timeout_seconds - elapsed_idle,
-                        ),
-                    )
-                )
-            except subprocess.TimeoutExpired:
-                pass
+    # ----------------------------------------------------------------------
+    # Assemble final message (after validation so malformed-but-parseable
+    # output doesn't mask exit-code / signal / missing-session errors).
+    # A successful turn posts only the closing reply; the full trace stays
+    # available as the fallback (and for the timeout path above).
+    # ----------------------------------------------------------------------
+    final_message = _assemble_final_reply(parsed_events, session_id)
 
-        if timeout_reason is not None:
-            # Kill and reap so the pipes close and the drain threads finish.
-            proc.kill()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                logger.warning("OpenCode process did not exit after kill")
-
-        # Give the drain threads a chance to flush buffered output; they
-        # finish on EOF. A leftover grandchild holding a pipe open only
-        # means we proceed with what we have.
-        stdout_thread.join(timeout=10)
-        stderr_thread.join(timeout=10)
-
-        if timeout_reason is not None:
-            stdout_text = b"".join(stdout_chunks).decode(errors="replace")
-            stderr_tail = _tail(b"".join(stderr_chunks).decode(errors="replace"))
-            # Best-effort salvage of partial output — must never mask the timeout.
-            try:
-                partial_session_id, partial_events = _parse_stream(stdout_text)
-                partial_message = _assemble_message(partial_events)
-            except Exception:
-                logger.debug(
-                    "Failed to salvage partial output on timeout", exc_info=True
-                )
-                partial_session_id = None
-                partial_message = ""
-            raise OpenCodeTimeout(
-                f"OpenCode turn timed out: {timeout_reason}\nstderr: {stderr_tail}",
-                partial_message=partial_message,
-                session_id=partial_session_id,
-                reason=timeout_reason,
-            )
-
-        # ------------------------------------------------------------------
-        # Decode outputs once.
-        # ------------------------------------------------------------------
-        stdout_text = b"".join(stdout_chunks).decode(errors="replace")
-        stderr_text = b"".join(stderr_chunks).decode(errors="replace")
-
-        # Raw OpenCode output; only useful when diagnosing parse/protocol issues.
-        logger.debug("=== raw OpenCode stdout ===\n%s\n=== end stdout ===", stdout_text)
-        if stderr_text:
-            logger.debug(
-                "=== raw OpenCode stderr ===\n%s\n=== end stderr ===", stderr_text
-            )
-
-        # ------------------------------------------------------------------
-        # Parse NDJSON events (lenient — corrupt lines are skipped).
-        # ------------------------------------------------------------------
-        session_id, parsed_events = _parse_stream(stdout_text)
-
-        # ------------------------------------------------------------------
-        # Extract context tokens from the last step_finish.
-        # ------------------------------------------------------------------
-        context_tokens = _extract_context_tokens(parsed_events)
-
-        # ------------------------------------------------------------------
-        # Validate.
-        # ------------------------------------------------------------------
-        exit_code = proc.returncode
-
-        # Detect external kill (negative returncode = killed by signal).
-        # Check this before non-zero exit so we can distinguish.
-        if exit_code is not None and exit_code < 0:
-            raise OpenCodeCancelled(f"OpenCode process killed by signal {-exit_code}")
-
-        if exit_code != 0:
-            raise OpenCodeError(
-                f"OpenCode exited with code {exit_code}\nstderr: {stderr_text[-2000:]}"
-            )
-
-        if session_id is None:
-            raise OpenCodeError(
-                "No session ID found in OpenCode JSON stream.\n"
-                f"stdout: {stdout_text[:2000]}\n"
-                f"stderr: {stderr_text[-2000:]}"
-            )
-
-        # ------------------------------------------------------------------
-        # Assemble final message (after validation so malformed-but-parseable
-        # output doesn't mask exit-code / signal / missing-session errors).
-        # A successful turn posts only the closing reply; the full trace stays
-        # available as the fallback (and for the timeout path above).
-        # ------------------------------------------------------------------
-        final_message = _assemble_final_reply(parsed_events, session_id)
-
-        return session_id, final_message, context_tokens
-
-    finally:
-        # Ensure the process is reaped if not already.
-        if proc.returncode is None:
-            try:
-                proc.kill()
-                proc.wait(timeout=5)
-            except Exception:
-                pass
+    return session_id, final_message, context_tokens
 
 
 def _assemble_final_reply(events: list[dict], session_id: str) -> str:
@@ -830,9 +649,3 @@ def _extract_context_tokens(events: list[dict]) -> int | None:
         cache_read = 0
         cache_write = 0
     return input_tokens + cache_read + cache_write
-
-
-def _tail(text: str, lines: int = 30) -> str:
-    """Return the last *lines* lines of *text*."""
-    all_lines = text.splitlines()
-    return "\n".join(all_lines[-lines:])

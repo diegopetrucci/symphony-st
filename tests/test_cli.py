@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+from shutil import which as shutil_which
 from unittest import mock
+
+import pytest
 
 from symphony_linear.cli import main
 
@@ -38,6 +41,15 @@ def _write_config(tmp_path: Path, content: str) -> Path:
     config_path = tmp_path / "config.yaml"
     config_path.write_text(content)
     return config_path
+
+
+@pytest.fixture(autouse=True)
+def _agent_binary_is_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep CLI tests independent from agent binaries installed on the host."""
+    monkeypatch.setattr(
+        "symphony_linear.cli.shutil.which",
+        lambda _binary, path=None: "/usr/bin/agent",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -159,3 +171,115 @@ class TestModelLabelProvisioningWiring:
             main(["--workspace", str(tmp_path)])
 
             mock_tracker.ensure_trigger_setup.assert_called_once_with(mock_state, [])
+
+
+# ---------------------------------------------------------------------------
+# Agent binary validation
+# ---------------------------------------------------------------------------
+
+
+class TestAgentBinaryValidation:
+    def test_startup_checks_selected_agent_binary(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _write_config(
+            tmp_path,
+            """\
+agent: omp
+linear:
+  api_key: test-key
+""",
+        )
+
+        sandbox_path = "/sandbox/bin"
+        monkeypatch.setenv("SYMPHONY_SANDBOX_PATH", sandbox_path)
+
+        with (
+            mock.patch("symphony_linear.cli.load_state") as mock_load_state,
+            mock.patch("symphony_linear.cli._create_tracker") as mock_create_tracker,
+            mock.patch("symphony_linear.cli.Orchestrator") as mock_orch_class,
+            mock.patch(
+                "symphony_linear.cli.shutil.which", return_value="/usr/bin/omp"
+            ) as mock_which,
+        ):
+            mock_load_state.return_value = mock.MagicMock()
+            mock_create_tracker.return_value = mock.MagicMock()
+            mock_orch_class.return_value = mock.MagicMock()
+
+            main(["--workspace", str(tmp_path)])
+
+        mock_which.assert_called_once_with("omp", path=sandbox_path)
+
+    def test_validate_config_checks_selected_agent_binary(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _write_config(
+            tmp_path,
+            """\
+agent: omp
+linear:
+  api_key: test-key
+""",
+        )
+
+        sandbox_path = "/sandbox/bin"
+        monkeypatch.setenv("SYMPHONY_SANDBOX_PATH", sandbox_path)
+
+        with mock.patch(
+            "symphony_linear.cli.shutil.which", return_value="/usr/bin/omp"
+        ) as mock_which:
+            main(["--workspace", str(tmp_path), "--validate-config"])
+
+        mock_which.assert_called_once_with("omp", path=sandbox_path)
+
+    def test_agent_found_only_via_sandbox_path_passes_validation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _write_config(
+            tmp_path,
+            """\
+agent: omp
+linear:
+  api_key: test-key
+""",
+        )
+        sandbox_bin = tmp_path / "sandbox-bin"
+        sandbox_bin.mkdir()
+        agent_binary = sandbox_bin / "omp"
+        agent_binary.write_text("#!/bin/sh\n")
+        agent_binary.chmod(0o755)
+        monkeypatch.setenv("PATH", str(tmp_path / "daemon-bin"))
+        monkeypatch.setenv("SYMPHONY_SANDBOX_PATH", str(sandbox_bin))
+        monkeypatch.setattr("symphony_linear.cli.shutil.which", shutil_which)
+
+        main(["--workspace", str(tmp_path), "--validate-config"])
+
+    def test_missing_agent_binary_fails_with_clear_message(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _write_config(
+            tmp_path,
+            """\
+agent: omp
+linear:
+  api_key: test-key
+""",
+        )
+        sandbox_bin = tmp_path / "sandbox-bin"
+        sandbox_bin.mkdir()
+        monkeypatch.setenv("PATH", str(tmp_path / "daemon-bin"))
+        monkeypatch.setenv("SYMPHONY_SANDBOX_PATH", str(sandbox_bin))
+        monkeypatch.setattr("symphony_linear.cli.shutil.which", shutil_which)
+
+        with pytest.raises(SystemExit) as excinfo:
+            main(["--workspace", str(tmp_path), "--validate-config"])
+
+        assert excinfo.value.code == 1
+        stderr = capsys.readouterr().err
+        assert "omp" in stderr
+        assert "PATH" in stderr
+        assert str(sandbox_bin) in stderr
+        assert "SYMPHONY_SANDBOX_PATH" in stderr

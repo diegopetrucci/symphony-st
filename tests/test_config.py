@@ -85,6 +85,7 @@ class TestLoadConfig:
         assert config.linear.api_key == "test-key"
         assert config.linear.trigger_label == "Agent"  # default
         assert config.sandbox.hide_paths  # defaults populated
+        assert config.agent == "opencode"  # default
         assert config.poll_interval_seconds == 30
         assert config.turn_timeout_seconds == 1800
         assert config.turn_idle_timeout_seconds == 1200
@@ -101,6 +102,30 @@ class TestLoadConfig:
 
         config = load_config(tmp_path)
         assert config.auto_branch is False
+
+    def test_agent_can_be_omp(self, tmp_path: Path) -> None:
+        cfg = {
+            "agent": "omp",
+            "linear": {
+                "api_key": "test-key",
+            },
+        }
+        _write_yaml(tmp_path / "config.yaml", cfg)
+
+        config = load_config(tmp_path)
+        assert config.agent == "omp"
+
+    def test_invalid_agent_is_rejected(self, tmp_path: Path) -> None:
+        cfg = {
+            "agent": "other",
+            "linear": {
+                "api_key": "test-key",
+            },
+        }
+        _write_yaml(tmp_path / "config.yaml", cfg)
+
+        with pytest.raises(ValueError, match="agent"):
+            load_config(tmp_path)
 
     def test_missing_required_field_raises(self, tmp_path: Path) -> None:
         cfg: dict[str, object] = {
