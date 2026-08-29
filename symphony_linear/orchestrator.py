@@ -33,7 +33,7 @@ from symphony_linear.tracker import (
     TrackerTransientError,
     TransitionTarget,
     is_bot_comment,
-    model_from_labels,
+    model_for_issue,
 )
 from symphony_linear.webhook import WebhookServer
 from symphony_linear.workspace import (
@@ -393,7 +393,7 @@ class Orchestrator:
             # recovery re-run rather than a fresh human-input turn.
             self._resume_pipeline(
                 ticket_state,
-                model_from_labels(issue.labels, self._config.models),
+                model_for_issue(issue, self._config.models),
                 replay_message=pending,
             )
         else:
@@ -503,9 +503,7 @@ class Orchestrator:
                                     issue.id,
                                     self._resume_pipeline,
                                     existing,
-                                    model_from_labels(
-                                        issue.labels, self._config.models
-                                    ),
+                                    model_for_issue(issue, self._config.models),
                                 )
                             else:
                                 self._schedule_task(
@@ -768,12 +766,13 @@ class Orchestrator:
                 elif st in (TicketStatus.needs_input, TicketStatus.failed):
                     tracked_issue = issues_by_id.get(tid)
                     if ticket_state.session_id:
-                        # Resolve the per-issue model override from the freshly
+                        # Resolve the effective model override (issue label,
+                        # else the issue's project label) from the freshly
                         # fetched issue.  When the ticket is not in the trigger
                         # list this tick there is no Issue at hand — pass None
                         # rather than making an extra tracker API call.
                         model = (
-                            model_from_labels(tracked_issue.labels, self._config.models)
+                            model_for_issue(tracked_issue, self._config.models)
                             if tracked_issue is not None
                             else None
                         )
@@ -1249,10 +1248,11 @@ class Orchestrator:
         if self._is_cancelled(tid):
             return
 
-        # Per-issue model override for the primary agent, resolved from the
-        # freshly fetched issue's labels.  Nothing is persisted: changing or
-        # removing the label takes effect on the next turn.
-        model = model_from_labels(issue.labels, self._config.models)
+        # Model override for the primary agent, resolved from the freshly
+        # fetched issue: a ``Model:`` label on the issue itself, else one on
+        # its project as a project-wide default.  Nothing is persisted:
+        # changing or removing either label takes effect on the next turn.
+        model = model_for_issue(issue, self._config.models)
 
         # --- Resolve repository URL ---
         try:

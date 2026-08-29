@@ -86,18 +86,24 @@ linear:
 # turn, losing that ticket's conversation history.
 agent: opencode
 
-# Optional. Per-issue model overrides for the primary agent.  A
-# `Model: <value>` label on an issue runs that issue's turns with
-# `--model <resolved>` passed to the selected agent, first turn and
-# resumes alike.  The
-# value is looked up case-insensitively here; a value that is not in the
-# map is used verbatim, so a raw provider/model id (e.g.
-# `Model: anthropic/claude-sonnet-4-6`) works with no config change.
-# Every value below must be a full `provider/model` id — the daemon
-# refuses to start otherwise.
-# Remove the label and the agent's own model applies again.  Subagents
-# keep their own models.  On Linear, one label per alias is created at
-# startup; on GitHub, labels are per-repository, so create them yourself.
+# Optional. Model overrides for the primary agent.  A `Model: <value>`
+# label runs an issue's turns with `--model <resolved>` passed to the
+# selected agent, first turn and resumes alike.  The label is read from
+# the issue first, then from its Linear project, so a project label is a
+# default for every issue in it: issue label > project label > the
+# agent's own model.  The value is looked up case-insensitively here; a
+# value that is not in the map is used verbatim, so a raw provider/model
+# id (e.g. `Model: anthropic/claude-sonnet-4-6`) works with no config
+# change.  Every value below must be a full `provider/model` id — the
+# daemon refuses to start otherwise.
+# Nothing is persisted: change or remove either label and the next turn
+# follows.  Subagents keep their own models.  On Linear each alias is
+# created at startup as both an issue label and a project label — two
+# separate namespaces, re-checked on every start.  The names must be
+# flat `Model: <alias>`; a label group named `Model` with a `Strong`
+# child does not work, because Linear reports only the child's own name.
+# On GitHub there is no project tier at all (Projects v2 has no project
+# labels), and issue labels are per-repository, so create them yourself.
 # models:
 #   Strong: anthropic/claude-opus-5
 #   Cheap: openai/gpt-5-mini

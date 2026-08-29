@@ -274,20 +274,34 @@ shutting down, or the ticket is no longer triggered — see `_is_still_triggered
   stdout/stderr tail, and the ticket is transitioned back to
   `needs_input_state` to avoid a respawn loop — except clean exits within
   10s, which are silent (the script is assumed to have daemonized a child).
-- **Per-issue model override via `Model: <value>` labels.** Resolved per
-  turn from the freshly fetched issue's labels by `model_from_labels` in
-  `tracker.py` (case-insensitive prefix match; value looked up in the
+- **Model override via `Model: <value>` labels, two tiers.** Resolved per
+  turn from the freshly fetched issue by `model_for_issue` in `tracker.py`:
+  the issue's own labels first, then `issue.project.labels` (a `None`
+  project leaves only the issue tier), so precedence is issue label >
+  project label > the agent's own default. Both tiers go through the same
+  `model_from_labels` (case-insensitive prefix match; value looked up in the
   top-level `models:` alias map case-insensitively, passed through verbatim
-  on a miss). The resolved id becomes `--model` for the primary agent's turns,
-  initial and resume; subagents are unaffected.
-  Nothing is persisted — changing or removing the label takes effect on
-  the next turn. The final-comment footer kind appends
+  on a miss), so alias handling and the empty-value / multiple-label
+  warnings behave identically either way. The resolved id becomes `--model`
+  for the primary agent's turns, initial and resume; subagents are
+  unaffected. Nothing is persisted — changing or removing either label takes
+  effect on the next turn. The final-comment footer kind appends
   `· model: <id>` when overridden (the middle dot is the U+00B7 footer
-  separator, so `is_bot_comment` still matches). One `Model: <alias>` label
-  per configured alias is provisioned on Linear at startup alongside the
-  trigger label (`provision_model_labels`, no state caching — unlike the
-  trigger label it re-checks every start); the GitHub backend ignores the
-  list, since its labels are per-repository and a project spans repos.
+  separator, so `is_bot_comment` still matches); it does not say which tier
+  won. Each configured alias is provisioned on Linear at startup alongside
+  the trigger label as *two* labels, one per namespace: `IssueLabel` and
+  `ProjectLabel` are unrelated objects and neither applies where the other
+  belongs (`provision_model_labels`, no state caching — unlike the trigger
+  label it re-checks every start, so two API calls per alias per start).
+  The labels must be flat and named exactly `Model: <alias>`: a Linear label
+  *group* named `Model` with children such as `Strong` does not work,
+  because Linear reports only the child's own name in every
+  `labels { nodes { name } }` selection, at either tier. That is reachable
+  only by hand-creating a group; the provisioned ones are flat.
+  The GitHub backend ignores the list and has no project tier
+  at all — Projects v2 has no project labels (`ProjectV2` has no `labels`
+  field and does not implement `Labelable`), and its issue labels are
+  per-repository while a project spans repos.
 
 ## Running and testing
 

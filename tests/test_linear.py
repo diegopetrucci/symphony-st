@@ -6,6 +6,7 @@ network calls.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import httpx
@@ -51,6 +52,21 @@ def _client(transport: httpx.MockTransport) -> LinearClient:
 
 def _json_response(data: dict[str, Any], status: int = 200) -> httpx.Response:
     return httpx.Response(status, json=data)
+
+
+def _capture_query(call: Any, response: dict[str, Any]) -> str:
+    """Run *call* against a client whose transport records the GraphQL query.
+
+    Returns the query string of the first request the call issued.
+    """
+    sent: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content)["query"])
+        return _json_response(response)
+
+    call(_client(_make_transport(handler)))
+    return sent[0]
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +268,88 @@ class TestListTriggeredIssues:
         issues = client.list_triggered_issues("Agent", ["In Progress"])
         assert issues == []
 
+    def test_parses_project_labels(self) -> None:
+        raw = {
+            "data": {
+                "issues": {
+                    "nodes": [
+                        {
+                            "id": "i-1",
+                            "identifier": "TEA-1",
+                            "title": "Do A",
+                            "updatedAt": "2025-06-01T00:00:00Z",
+                            "state": {"name": "In Progress"},
+                            "labels": {"nodes": [{"name": "Agent"}]},
+                            "branchName": None,
+                            "project": {
+                                "id": "p-1",
+                                "name": "Core",
+                                "labels": {
+                                    "nodes": [
+                                        {"name": "Model: opus"},
+                                        {"name": "tier-1"},
+                                    ]
+                                },
+                            },
+                        }
+                    ]
+                }
+            }
+        }
+        transport = _make_transport(lambda req: _json_response(raw))
+        client = _client(transport)
+        issues = client.list_triggered_issues("Agent", ["In Progress"])
+
+        assert issues[0].project is not None
+        assert issues[0].project.labels == ["Model: opus", "tier-1"]
+
+    def test_missing_or_null_project_labels_parse_as_empty(self) -> None:
+        def node(issue_id: str, project: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "id": issue_id,
+                "identifier": issue_id.upper(),
+                "title": "T",
+                "updatedAt": "2025-06-01T00:00:00Z",
+                "state": {"name": "In Progress"},
+                "labels": {"nodes": [{"name": "Agent"}]},
+                "branchName": None,
+                "project": project,
+            }
+
+        raw = {
+            "data": {
+                "issues": {
+                    "nodes": [
+                        node("i-1", {"id": "p-1", "name": "NoKey"}),
+                        node("i-2", {"id": "p-2", "name": "Null", "labels": None}),
+                        node(
+                            "i-3",
+                            {
+                                "id": "p-3",
+                                "name": "NullNodes",
+                                "labels": {"nodes": None},
+                            },
+                        ),
+                    ]
+                }
+            }
+        }
+        transport = _make_transport(lambda req: _json_response(raw))
+        client = _client(transport)
+        issues = client.list_triggered_issues("Agent", ["In Progress"])
+
+        assert len(issues) == 3
+        for issue in issues:
+            assert issue.project is not None
+            assert issue.project.labels == []
+
+    def test_query_requests_project_labels(self) -> None:
+        query = _capture_query(
+            lambda c: c.list_triggered_issues("Agent", ["In Progress"]),
+            {"data": {"issues": {"nodes": []}}},
+        )
+        assert "labels(first: 50) { nodes { name } }" in query
+
 
 # ---------------------------------------------------------------------------
 # get_issue
@@ -310,6 +408,63 @@ class TestGetIssue:
         assert issue.archived_at is not None
         assert issue.archived_at.year == 2025
 
+    def test_parses_project_labels(self, sample_issue_raw: dict[str, Any]) -> None:
+        sample_issue_raw["project"]["labels"] = {"nodes": [{"name": "Model: sonnet"}]}
+        transport = _make_transport(
+            lambda req: _json_response({"data": {"issue": sample_issue_raw}})
+        )
+        client = _client(transport)
+        issue = client.get_issue("abc-123")
+
+        assert issue.project is not None
+        assert issue.project.labels == ["Model: sonnet"]
+
+    def test_project_labels_default_to_empty(
+        self, sample_issue_raw: dict[str, Any]
+    ) -> None:
+        # The fixture's nested project carries no ``labels`` key at all.
+        transport = _make_transport(
+            lambda req: _json_response({"data": {"issue": sample_issue_raw}})
+        )
+        client = _client(transport)
+        issue = client.get_issue("abc-123")
+
+        assert issue.project is not None
+        assert issue.project.labels == []
+
+    def test_issue_without_project_parses(
+        self, sample_issue_raw: dict[str, Any]
+    ) -> None:
+        sample_issue_raw["project"] = None
+        transport = _make_transport(
+            lambda req: _json_response({"data": {"issue": sample_issue_raw}})
+        )
+        client = _client(transport)
+        issue = client.get_issue("abc-123")
+
+        assert issue.project is None
+
+    def test_query_requests_project_labels(self) -> None:
+        query = _capture_query(
+            lambda c: c.get_issue("abc-123"),
+            {
+                "data": {
+                    "issue": {
+                        "id": "abc-123",
+                        "identifier": "TEAM-42",
+                        "title": "T",
+                        "updatedAt": "2025-06-01T00:00:00Z",
+                        "state": {"name": "In Progress"},
+                        "labels": {"nodes": []},
+                        "branchName": None,
+                        "project": None,
+                        "comments": {"nodes": []},
+                    }
+                }
+            },
+        )
+        assert "labels(first: 50) { nodes { name } }" in query
+
 
 # ---------------------------------------------------------------------------
 # get_project
@@ -350,6 +505,54 @@ class TestGetProject:
         client = _client(transport)
         project = client.get_project("proj-2")
         assert project.links == []
+
+    def test_parses_labels(self, sample_project_raw: dict[str, Any]) -> None:
+        sample_project_raw["labels"] = {
+            "nodes": [{"name": "Model: opus"}, {"name": "Model: sonnet"}]
+        }
+        transport = _make_transport(
+            lambda req: _json_response({"data": {"project": sample_project_raw}})
+        )
+        client = _client(transport)
+        project = client.get_project("proj-1")
+
+        assert project.labels == ["Model: opus", "Model: sonnet"]
+
+    def test_project_without_labels_key(
+        self, sample_project_raw: dict[str, Any]
+    ) -> None:
+        assert "labels" not in sample_project_raw
+        transport = _make_transport(
+            lambda req: _json_response({"data": {"project": sample_project_raw}})
+        )
+        client = _client(transport)
+        project = client.get_project("proj-1")
+
+        assert project.labels == []
+
+    def test_project_with_empty_labels_nodes(self) -> None:
+        raw = {
+            "data": {
+                "project": {
+                    "id": "proj-3",
+                    "name": "NoLabels",
+                    "externalLinks": {"nodes": []},
+                    "labels": {"nodes": []},
+                }
+            }
+        }
+        transport = _make_transport(lambda req: _json_response(raw))
+        client = _client(transport)
+        project = client.get_project("proj-3")
+
+        assert project.labels == []
+
+    def test_query_requests_labels(self) -> None:
+        query = _capture_query(
+            lambda c: c.get_project("proj-1"),
+            {"data": {"project": {"id": "proj-1", "name": "Backend"}}},
+        )
+        assert "labels(first: 50) { nodes { name } }" in query
 
     def test_not_found_raises(self) -> None:
         transport = _make_transport(
@@ -765,3 +968,101 @@ class TestCreateWorkspaceLabel:
         client = _client(transport)
         with pytest.raises(LinearError, match="Failed to create workspace label"):
             client.create_workspace_label("Agent")
+
+
+# ---------------------------------------------------------------------------
+# find_project_label
+# ---------------------------------------------------------------------------
+
+
+class TestFindProjectLabel:
+    def test_returns_id_when_label_exists(self) -> None:
+        raw = {"data": {"projectLabels": {"nodes": [{"id": "lbl-model"}]}}}
+        transport = _make_transport(lambda req: _json_response(raw))
+        client = _client(transport)
+        assert client.find_project_label("Model: Strong") == "lbl-model"
+
+    def test_returns_none_when_no_matches(self) -> None:
+        raw: dict[str, Any] = {"data": {"projectLabels": {"nodes": []}}}
+        transport = _make_transport(lambda req: _json_response(raw))
+        client = _client(transport)
+        assert client.find_project_label("Model: Strong") is None
+
+    def test_returns_none_when_key_missing(self) -> None:
+        """Gracefully handle a response without the projectLabels key."""
+        raw: dict[str, Any] = {"data": {}}
+        transport = _make_transport(lambda req: _json_response(raw))
+        client = _client(transport)
+        assert client.find_project_label("Model: Strong") is None
+
+    def test_queries_project_label_namespace_by_name(self) -> None:
+        """The lookup hits projectLabels, not issueLabels, with the name filter."""
+        seen: dict[str, Any] = {}
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            seen.update(json.loads(req.content))
+            return _json_response({"data": {"projectLabels": {"nodes": []}}})
+
+        client = _client(_make_transport(handler))
+        client.find_project_label("Model: Strong")
+
+        assert "projectLabels(" in seen["query"]
+        assert "issueLabels" not in seen["query"]
+        assert seen["variables"] == {"name": "Model: Strong"}
+
+
+# ---------------------------------------------------------------------------
+# create_project_label
+# ---------------------------------------------------------------------------
+
+
+class TestCreateProjectLabel:
+    def test_creates_and_returns_label_id(self) -> None:
+        raw = {
+            "data": {
+                "projectLabelCreate": {
+                    "success": True,
+                    "projectLabel": {"id": "lbl-new"},
+                }
+            }
+        }
+        transport = _make_transport(lambda req: _json_response(raw))
+        client = _client(transport)
+        assert client.create_project_label("Model: Strong") == "lbl-new"
+
+    def test_failure_raises_linear_error(self) -> None:
+        raw = {
+            "data": {
+                "projectLabelCreate": {
+                    "success": False,
+                    "projectLabel": None,
+                }
+            }
+        }
+        transport = _make_transport(lambda req: _json_response(raw))
+        client = _client(transport)
+        with pytest.raises(LinearError, match="Failed to create project label"):
+            client.create_project_label("Model: Strong")
+
+    def test_sends_only_the_name_in_the_input(self) -> None:
+        """No teamId (workspace-wide) and no group fields are sent."""
+        seen: dict[str, Any] = {}
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            seen.update(json.loads(req.content))
+            return _json_response(
+                {
+                    "data": {
+                        "projectLabelCreate": {
+                            "success": True,
+                            "projectLabel": {"id": "lbl-new"},
+                        }
+                    }
+                }
+            )
+
+        client = _client(_make_transport(handler))
+        client.create_project_label("Model: Strong")
+
+        assert "projectLabelCreate(" in seen["query"]
+        assert seen["variables"] == {"input": {"name": "Model: Strong"}}

@@ -336,8 +336,8 @@ linear:
   # disable the feature entirely.
   # qa_state: QA
 
-# Optional. Per-issue model overrides, keyed by alias. See "Per-issue
-# model override" below.
+# Optional. Model overrides for the primary agent, keyed by alias. See
+# "Model override" below.
 # models:
 #   Strong: anthropic/claude-opus-5
 #   Cheap: openai/gpt-5-mini
@@ -390,12 +390,16 @@ turn_idle_timeout_seconds: 1200
 
 A copy of this example lives at `config.yaml.example` in the repo root.
 
-### Per-issue model override
+### Model override
 
-A `Model: <value>` label on an issue picks the model for that ticket's
-primary agent. The daemon passes `--model` to the selected coding agent on
-every turn for that ticket, first turn and resumes alike. Subagents keep their
-own models.
+A `Model: <value>` label picks the model for a ticket's primary agent. The
+daemon passes `--model` to the selected coding agent on every turn for that
+ticket, first turn and resumes alike. Subagents keep their own models.
+
+The label is read from the issue first, then from the issue's Linear project,
+so the precedence is **issue label > project label > the agent's own
+default**. A `Model:` label on a project is therefore a default for every
+issue in it, and an issue label overrides that default one ticket at a time.
 
 The value is looked up case-insensitively in the top-level `models` map:
 
@@ -415,15 +419,32 @@ works with no config change:
 - `Model: Strong` → `--model anthropic/claude-opus-5`
 - `Model: anthropic/claude-sonnet-4-6` → `--model anthropic/claude-sonnet-4-6`
 
-On Linear, one label per alias (`Model: Strong`, `Model: Cheap`) is created
-at startup, next to the trigger label. On GitHub, labels are per-repository,
-so create them yourself.
+On Linear each alias is created for you at startup — once as an issue label
+and once as a project label — alongside the trigger label, which is only ever
+an issue label. Linear keeps issue labels and project labels in two unrelated
+namespaces (`IssueLabel` and `ProjectLabel`), and neither can be applied
+where the other belongs. Nothing records what was already created, so the
+daemon re-checks both namespaces on every start — two API calls per
+configured alias.
 
-Nothing is persisted. Change the label and the next turn uses the new model;
-remove it and the agent's own model applies again. The final comment names
-the model when one was resolved. Model ids are not validated: a bad value
-makes the selected agent exit at once, and the ticket lands in Needs Input
-with the error.
+The labels must be flat and named exactly `Model: <alias>`. A Linear label
+*group* named `Model` with children such as `Strong` does not work: the API
+reports only the child's own name, which carries no `Model:` prefix. The
+provisioned labels are flat, so this only comes up if you hand-create a
+group.
+
+On GitHub there is no project tier. GitHub Projects v2 has no project labels
+at all — `ProjectV2` has no `labels` field and does not implement
+`Labelable` — so a GitHub deployment has the per-issue label and the agent's
+own default, with nothing in between. GitHub issue labels are also
+per-repository, so create them yourself in each repo.
+
+Nothing is persisted. The model is resolved fresh from the polled issue on
+every turn, so changing or removing either label takes effect on the next
+turn. The final comment's footer reports the effective model as
+`· model: <id>`; it does not say which tier it came from. Model ids are not
+validated: a bad value makes the selected agent exit at once, and the ticket
+lands in Needs Input with the error.
 
 ### Webhook (optional)
 

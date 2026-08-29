@@ -389,6 +389,99 @@ class TestNewTicketPipeline:
         )
         assert final_bodies[0] == expected
 
+    def test_project_model_label_reaches_run_initial_and_footer(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """A Model: label on the issue's project is the default when the issue
+        carries none: it reaches run_initial and the footer names it without
+        hinting at which tier it came from."""
+        orchestrator._config.models["cheap"] = "openai/gpt-5-mini"
+        linear.set_response(
+            "get_project",
+            Project(
+                id="proj-1",
+                name="Test",
+                links=[
+                    ProjectLink(label="Repo", url="https://github.com/org/repo.git")
+                ],
+            ),
+        )
+        linear.set_response("get_issue", _make_issue(description="Fix the bug"))
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.clone_workspace",
+                return_value=("/tmp/ws/TEAM-1", False),
+            ),
+            mock.patch("symphony_linear.orchestrator.finalize_workspace"),
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config",
+                return_value=ProjectConfig(),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.run_initial",
+                return_value=("ses-abc", "Done!", 37074),
+            ) as mock_run_initial,
+        ):
+            orchestrator._new_ticket_pipeline(
+                _make_issue(
+                    labels=["Agent"],
+                    project=Project(
+                        id="proj-1", name="Test Project", labels=["Model: cheap"]
+                    ),
+                )
+            )
+
+        assert mock_run_initial.call_args.kwargs["model"] == "openai/gpt-5-mini"
+        post_calls = linear.calls.get("post_comment", [])
+        final_bodies = [body for _tid, body in post_calls if "Done!" in body]
+        assert final_bodies == [
+            "Done!\n\n*Symphony · context: 37,074 tokens · model: openai/gpt-5-mini*"
+        ]
+
+    def test_issue_model_label_beats_project_model_label(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """With both tiers labelled, the issue's own label is the one used."""
+        orchestrator._config.models.update(
+            {"strong": "anthropic/claude-opus-5", "cheap": "openai/gpt-5-mini"}
+        )
+        linear.set_response(
+            "get_project",
+            Project(
+                id="proj-1",
+                name="Test",
+                links=[
+                    ProjectLink(label="Repo", url="https://github.com/org/repo.git")
+                ],
+            ),
+        )
+        linear.set_response("get_issue", _make_issue(description="Fix the bug"))
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.clone_workspace",
+                return_value=("/tmp/ws/TEAM-1", False),
+            ),
+            mock.patch("symphony_linear.orchestrator.finalize_workspace"),
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config",
+                return_value=ProjectConfig(),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.run_initial",
+                return_value=("ses-abc", "Done!", 37074),
+            ) as mock_run_initial,
+        ):
+            orchestrator._new_ticket_pipeline(
+                _make_issue(
+                    labels=["Agent", "Model: strong"],
+                    project=Project(
+                        id="proj-1", name="Test Project", labels=["Model: cheap"]
+                    ),
+                )
+            )
+
+        assert mock_run_initial.call_args.kwargs["model"] == "anthropic/claude-opus-5"
+
     def test_missing_repo_saves_setup_error(
         self, orchestrator: Orchestrator, linear: FakeLinearClient
     ) -> None:

@@ -76,11 +76,12 @@ class ProjectLink(BaseModel):
 
 
 class Project(BaseModel):
-    """A Linear project with its links."""
+    """A Linear project with its links and labels."""
 
     id: str
     name: str
     links: list[ProjectLink] = Field(default_factory=list)
+    labels: list[str] = Field(default_factory=list)
 
 
 class Issue(BaseModel):
@@ -243,7 +244,7 @@ class LinearClient:
               state { name }
               labels { nodes { name } }
               branchName
-              project { id name }
+              project { id name labels(first: 50) { nodes { name } } }
             }
           }
         }
@@ -273,7 +274,7 @@ class LinearClient:
             state { name }
             labels { nodes { name } }
             branchName
-            project { id name }
+            project { id name labels(first: 50) { nodes { name } } }
             comments(first: 50, orderBy: createdAt) {
               nodes {
                 id
@@ -299,6 +300,7 @@ class LinearClient:
             id
             name
             externalLinks { nodes { label url } }
+            labels(first: 50) { nodes { name } }
           }
         }
         """
@@ -489,6 +491,48 @@ class LinearClient:
             raise LinearError(f"Failed to create workspace label '{name}'")
         return payload["issueLabel"]["id"]
 
+    def find_project_label(self, name: str) -> str | None:
+        """Return the id of a project label with the exact *name*, or ``None``.
+
+        Project labels are a separate namespace from issue labels and are
+        always workspace-wide, so there is no team filter to apply.
+        """
+        query = """
+        query($name: String!) {
+          projectLabels(filter: { name: { eq: $name } }, first: 10) {
+            nodes {
+              id
+            }
+          }
+        }
+        """
+        data = self._query(query, {"name": name})
+        nodes: list[dict[str, str]] = data.get("projectLabels", {}).get("nodes", [])
+        if nodes:
+            return nodes[0]["id"]
+        return None
+
+    def create_project_label(self, name: str) -> str:
+        """Create a project label with *name* (no teamId).
+
+        Returns the new label's id. Raises ``LinearError`` on failure.
+        """
+        mutation = """
+        mutation($input: ProjectLabelCreateInput!) {
+          projectLabelCreate(input: $input) {
+            success
+            projectLabel {
+              id
+            }
+          }
+        }
+        """
+        data = self._query(mutation, {"input": {"name": name}})
+        payload = data["projectLabelCreate"]
+        if not payload.get("success"):
+            raise LinearError(f"Failed to create project label '{name}'")
+        return payload["projectLabel"]["id"]
+
     def _resolve_state_id(self, issue_id: str, state_name: str) -> str:
         """Query the issue's team workflow states and return the id for *state_name*.
 
@@ -534,6 +578,17 @@ class LinearClient:
 # ---------------------------------------------------------------------------
 
 
+def _connection_names(connection: dict[str, Any] | None) -> list[str]:
+    """Return the ``name`` of every node in a ``{ nodes: [{ name }] }`` connection.
+
+    Callers pass ``raw.get("labels")`` directly: a missing or ``null``
+    connection, and a connection with a ``null`` node list, both yield ``[]``.
+    """
+    if not connection:
+        return []
+    return [node["name"] for node in connection.get("nodes") or []]
+
+
 def _parse_issue_summary(raw: dict[str, Any]) -> Issue:
     """Parse an issue from a ``list_triggered_issues`` response node."""
     return Issue(
@@ -542,13 +597,9 @@ def _parse_issue_summary(raw: dict[str, Any]) -> Issue:
         title=raw["title"],
         description=raw.get("description"),
         state=raw.get("state", {}).get("name", ""),
-        labels=[n["name"] for n in raw.get("labels", {}).get("nodes", [])],
+        labels=_connection_names(raw.get("labels")),
         branchName=raw.get("branchName"),
-        project=(
-            Project(id=raw["project"]["id"], name=raw["project"]["name"])
-            if raw.get("project")
-            else None
-        ),
+        project=_parse_project(raw["project"]) if raw.get("project") else None,
         archivedAt=raw.get("archivedAt"),
         updatedAt=raw["updatedAt"],
     )
@@ -562,13 +613,9 @@ def _parse_issue_full(raw: dict[str, Any]) -> Issue:
         title=raw["title"],
         description=raw.get("description"),
         state=raw.get("state", {}).get("name", ""),
-        labels=[n["name"] for n in raw.get("labels", {}).get("nodes", [])],
+        labels=_connection_names(raw.get("labels")),
         branchName=raw.get("branchName"),
-        project=(
-            Project(id=raw["project"]["id"], name=raw["project"]["name"])
-            if raw.get("project")
-            else None
-        ),
+        project=_parse_project(raw["project"]) if raw.get("project") else None,
         archivedAt=raw.get("archivedAt"),
         updatedAt=raw["updatedAt"],
         comments=[
@@ -584,14 +631,17 @@ def _parse_issue_full(raw: dict[str, Any]) -> Issue:
 
 
 def _parse_project(raw: dict[str, Any]) -> Project:
-    """Parse a project from a ``get_project`` response node."""
+    """Parse a project from a ``get_project`` response node, or from a nested
+    ``project { ... }`` selection on an issue (which carries no ``externalLinks``).
+    """
     return Project(
         id=raw["id"],
         name=raw["name"],
         links=[
             ProjectLink(label=link["label"], url=link["url"])
-            for link in raw.get("externalLinks", {}).get("nodes", [])
+            for link in (raw.get("externalLinks") or {}).get("nodes") or []
         ],
+        labels=_connection_names(raw.get("labels")),
     )
 
 

@@ -23,16 +23,25 @@ def _fake_linear(
     create_id: str | None = None,
     create_error: Exception | None = None,
 ) -> MagicMock:
-    """Build a mock LinearClient with configurable find/create behaviour."""
+    """Build a mock LinearClient with configurable find/create behaviour.
+
+    The same behaviour is applied to both label namespaces (issue labels and
+    project labels), since ``provision_model_labels`` ensures every name in
+    both.
+    """
     linear = MagicMock()
-    if find_error:
-        linear.find_workspace_label.side_effect = find_error
-    else:
-        linear.find_workspace_label.return_value = find_id
-    if create_error:
-        linear.create_workspace_label.side_effect = create_error
-    else:
-        linear.create_workspace_label.return_value = create_id
+    for find, create in (
+        ("find_workspace_label", "create_workspace_label"),
+        ("find_project_label", "create_project_label"),
+    ):
+        if find_error:
+            getattr(linear, find).side_effect = find_error
+        else:
+            getattr(linear, find).return_value = find_id
+        if create_error:
+            getattr(linear, create).side_effect = create_error
+        else:
+            getattr(linear, create).return_value = create_id
     return linear
 
 
@@ -121,7 +130,7 @@ class TestApiFailures:
         with caplog.at_level(logging.WARNING):
             provision_trigger_label(linear, state, "Agent")
 
-        assert "Failed to auto-provision Linear label 'Agent'" in caplog.text
+        assert "Failed to auto-provision Linear issue label 'Agent'" in caplog.text
         assert "Network down" in caplog.text
         linear.create_workspace_label.assert_not_called()
         assert state.provisioned_label_name is None
@@ -142,7 +151,7 @@ class TestApiFailures:
         with caplog.at_level(logging.WARNING):
             provision_trigger_label(linear, state, "Agent")
 
-        assert "Failed to auto-provision Linear label 'Agent'" in caplog.text
+        assert "Failed to auto-provision Linear issue label 'Agent'" in caplog.text
         assert "Permission denied" in caplog.text
         assert state.provisioned_label_name is None
 
@@ -179,7 +188,7 @@ class TestApiFailures:
         with caplog.at_level(logging.WARNING):
             provision_trigger_label(linear, state, "Agent")
 
-        assert "Failed to auto-provision Linear label 'Agent'" in caplog.text
+        assert "Failed to auto-provision Linear issue label 'Agent'" in caplog.text
         assert "Network timeout during retry" in caplog.text
         assert linear.find_workspace_label.call_count == 2
         assert state.provisioned_label_name is None
@@ -199,7 +208,7 @@ class TestApiFailures:
         with caplog.at_level(logging.WARNING):
             provision_trigger_label(linear, state, "Agent")
 
-        assert "Failed to auto-provision Linear label 'Agent'" in caplog.text
+        assert "Failed to auto-provision Linear issue label 'Agent'" in caplog.text
         assert "boom" in caplog.text
         assert linear.find_workspace_label.call_count == 2
         assert state.provisioned_label_name is None
@@ -226,55 +235,74 @@ class TestExceptionDoesNotPropagate:
         with caplog.at_level(logging.WARNING):
             provision_trigger_label(linear, state, "Agent")
 
-        assert "Failed to auto-provision Linear label 'Agent'" in caplog.text
+        assert "Failed to auto-provision Linear issue label 'Agent'" in caplog.text
         assert "disk full" in caplog.text
         state.set_provisioned_label_name.assert_called_once_with("Agent")
 
 
 class TestProvisionModelLabels:
-    def test_creates_missing_labels(self) -> None:
-        """Missing labels are each created via find→create."""
+    def test_creates_missing_labels_in_both_namespaces(self) -> None:
+        """Each missing name is created as an issue label and a project label."""
         linear = _fake_linear(find_id=None, create_id="lbl-new")
 
         provision_model_labels(linear, ["Model: Strong", "Model: Cheap"])
 
-        linear.find_workspace_label.assert_has_calls(
-            [call("Model: Strong"), call("Model: Cheap")]
-        )
-        linear.create_workspace_label.assert_has_calls(
-            [call("Model: Strong"), call("Model: Cheap")]
-        )
+        both = [call("Model: Strong"), call("Model: Cheap")]
+        linear.find_workspace_label.assert_has_calls(both)
+        linear.create_workspace_label.assert_has_calls(both)
+        linear.find_project_label.assert_has_calls(both)
+        linear.create_project_label.assert_has_calls(both)
 
-    def test_existing_label_not_recreated(self) -> None:
-        """A label that already exists is found but never created."""
+    def test_existing_labels_not_recreated(self) -> None:
+        """Labels that already exist are found but never created."""
         linear = _fake_linear(find_id="lbl-existing")
 
         provision_model_labels(linear, ["Model: Strong"])
 
         linear.find_workspace_label.assert_called_once_with("Model: Strong")
+        linear.find_project_label.assert_called_once_with("Model: Strong")
         linear.create_workspace_label.assert_not_called()
+        linear.create_project_label.assert_not_called()
+
+    def test_existing_project_label_with_missing_issue_label(self) -> None:
+        """The two namespaces are resolved independently of each other."""
+        linear = MagicMock()
+        linear.find_workspace_label.return_value = None
+        linear.create_workspace_label.return_value = "lbl-issue"
+        linear.find_project_label.return_value = "lbl-project-existing"
+
+        provision_model_labels(linear, ["Model: Strong"])
+
+        linear.create_workspace_label.assert_called_once_with("Model: Strong")
+        linear.create_project_label.assert_not_called()
 
     def test_find_error_warns_and_does_not_raise(self, caplog) -> None:
-        """A failing find warns and does not raise or attempt a create."""
+        """A failing find warns, naming the namespace, and attempts no create."""
         linear = _fake_linear(find_error=LinearError("Network down"))
 
         with caplog.at_level(logging.WARNING):
             provision_model_labels(linear, ["Model: Strong"])
 
-        assert "Failed to auto-provision Linear label 'Model: Strong'" in caplog.text
+        issue = "Failed to auto-provision Linear issue label 'Model: Strong'"
+        project = "Failed to auto-provision Linear project label 'Model: Strong'"
+        assert issue in caplog.text
+        assert project in caplog.text
         assert "Network down" in caplog.text
         linear.create_workspace_label.assert_not_called()
+        linear.create_project_label.assert_not_called()
 
     def test_create_error_warns_and_does_not_raise(self, caplog) -> None:
-        """A failing create (and retry-find) warns and does not raise."""
+        """A failing issue-label create (and retry-find) warns, does not raise."""
         linear = MagicMock()
         linear.find_workspace_label.side_effect = [None, None]
         linear.create_workspace_label.side_effect = LinearError("Permission denied")
+        linear.find_project_label.return_value = "lbl-project"
 
         with caplog.at_level(logging.WARNING):
             provision_model_labels(linear, ["Model: Strong"])
 
-        assert "Failed to auto-provision Linear label 'Model: Strong'" in caplog.text
+        issue = "Failed to auto-provision Linear issue label 'Model: Strong'"
+        assert issue in caplog.text
         assert "Permission denied" in caplog.text
         assert linear.find_workspace_label.call_count == 2
 
@@ -283,11 +311,64 @@ class TestProvisionModelLabels:
         linear = MagicMock()
         linear.find_workspace_label.side_effect = [None, "lbl-race"]
         linear.create_workspace_label.side_effect = LinearError("Already exists")
+        linear.find_project_label.return_value = "lbl-project"
 
         with caplog.at_level(logging.WARNING):
             provision_model_labels(linear, ["Model: Strong"])
 
         assert linear.find_workspace_label.call_count == 2
+        assert not caplog.records
+
+    def test_project_find_error_warns_and_continues(self, caplog) -> None:
+        """A project-label failure warns, does not raise, does not stop the rest."""
+        linear = MagicMock()
+        linear.find_workspace_label.return_value = "lbl-issue"
+        linear.find_project_label.side_effect = [
+            LinearError("Project labels down"),
+            "lbl-project",
+        ]
+
+        with caplog.at_level(logging.WARNING):
+            provision_model_labels(linear, ["Model: Strong", "Model: Cheap"])
+
+        project = "Failed to auto-provision Linear project label 'Model: Strong'"
+        assert project in caplog.text
+        assert "Project labels down" in caplog.text
+        # The issue-label namespace was fine, so no issue-label warning.
+        assert "issue label" not in caplog.text
+        assert linear.find_project_label.call_count == 2
+        linear.create_project_label.assert_not_called()
+        linear.find_workspace_label.assert_has_calls(
+            [call("Model: Strong"), call("Model: Cheap")]
+        )
+
+    def test_project_create_error_warns_and_does_not_raise(self, caplog) -> None:
+        """A failing project-label create (and retry-find) warns, does not raise."""
+        linear = MagicMock()
+        linear.find_workspace_label.return_value = "lbl-issue"
+        linear.find_project_label.side_effect = [None, None]
+        linear.create_project_label.side_effect = LinearError("Permission denied")
+
+        with caplog.at_level(logging.WARNING):
+            provision_model_labels(linear, ["Model: Strong"])
+
+        project = "Failed to auto-provision Linear project label 'Model: Strong'"
+        assert project in caplog.text
+        assert "Permission denied" in caplog.text
+        assert linear.find_project_label.call_count == 2
+
+    def test_project_create_error_race_resolved_succeeds(self, caplog) -> None:
+        """Project-label create fails (race), retry-find resolves it – no warning."""
+        linear = MagicMock()
+        linear.find_workspace_label.return_value = "lbl-issue"
+        linear.find_project_label.side_effect = [None, "lbl-race"]
+        linear.create_project_label.side_effect = LinearError("Already exists")
+
+        with caplog.at_level(logging.WARNING):
+            provision_model_labels(linear, ["Model: Strong"])
+
+        assert linear.find_project_label.call_count == 2
+        linear.create_project_label.assert_called_once_with("Model: Strong")
         assert not caplog.records
 
     def test_continues_after_one_failure(self, caplog) -> None:
@@ -297,19 +378,23 @@ class TestProvisionModelLabels:
             LinearError("Network down"),
             "lbl-ok",
         ]
+        linear.find_project_label.return_value = "lbl-project"
 
         with caplog.at_level(logging.WARNING):
             provision_model_labels(linear, ["Model: Strong", "Model: Cheap"])
 
-        assert "Failed to auto-provision Linear label 'Model: Strong'" in caplog.text
+        issue = "Failed to auto-provision Linear issue label 'Model: Strong'"
+        assert issue in caplog.text
         assert linear.find_workspace_label.call_count == 2
         linear.create_workspace_label.assert_not_called()
 
     def test_empty_labels_no_api_calls(self) -> None:
-        """An empty alias map does nothing."""
+        """An empty alias map does nothing in either namespace."""
         linear = _fake_linear()
 
         provision_model_labels(linear, [])
 
         linear.find_workspace_label.assert_not_called()
         linear.create_workspace_label.assert_not_called()
+        linear.find_project_label.assert_not_called()
+        linear.create_project_label.assert_not_called()

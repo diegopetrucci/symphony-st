@@ -45,7 +45,11 @@ def model_label_name(alias: str) -> str:
     return f"{_MODEL_LABEL_PREFIX.capitalize()} {alias}"
 
 
-def model_from_labels(labels: list[str], aliases: Mapping[str, str]) -> str | None:
+def model_from_labels(
+    labels: list[str],
+    aliases: Mapping[str, str],
+    source: str = "ticket",
+) -> str | None:
     """Resolve a per-issue model override from ``Model: <value>`` labels.
 
     A label whose stripped name starts with ``model:`` (case-insensitive)
@@ -59,6 +63,10 @@ def model_from_labels(labels: list[str], aliases: Mapping[str, str]) -> str | No
 
     Returns ``None`` when no label matches.  Config-agnostic: *aliases* is
     a plain mapping, not an ``AppConfig``.
+
+    *source* names the object the labels were read off — ``"ticket"`` or
+    ``"project"`` — and appears in both warnings so an operator knows
+    which one in Linear to go and fix.
     """
     matches: list[str] = []
     for label in labels:
@@ -74,17 +82,44 @@ def model_from_labels(labels: list[str], aliases: Mapping[str, str]) -> str | No
     for candidate in matches:
         value = candidate[len(_MODEL_LABEL_PREFIX) :].strip()
         if not value:
-            logger.warning("Ignoring Model: label %r — empty value", candidate)
+            logger.warning(
+                "Ignoring Model: label %r on %s — empty value", candidate, source
+            )
             continue
         if len(matches) > 1:
             logger.warning(
-                "Multiple Model: labels on ticket (%s) — using %r",
+                "Multiple Model: labels on %s (%s) — using %r",
+                source,
                 ", ".join(matches),
                 candidate,
             )
         return lowered_aliases.get(value.lower(), value)
 
     return None
+
+
+def model_for_issue(issue: Issue, aliases: Mapping[str, str]) -> str | None:
+    """Resolve the effective model override for *issue*, issue tier first.
+
+    A ``Model: <value>`` label on the issue itself wins.  Failing that, the
+    same labels are read off the issue's project, so a project-wide label
+    acts as a default for every issue in it.  Returns ``None`` when neither
+    tier carries one (the agent's own default applies).  Both tiers go
+    through ``model_from_labels``, so alias lookup, verbatim pass-through
+    and the empty/multiple-label handling behave identically either way;
+    only the warning text differs, naming the tier ("ticket" or
+    "project") that carries the offending label.
+
+    ``issue.project`` is ``None`` on trackers without a project concept
+    (and on issues that simply have no project), which leaves only the
+    issue tier.
+    """
+    from_issue = model_from_labels(issue.labels, aliases)
+    if from_issue is not None:
+        return from_issue
+    if issue.project is None:
+        return None
+    return model_from_labels(issue.project.labels, aliases, source="project")
 
 
 def normalise_content_type(value: str | None) -> str | None:
