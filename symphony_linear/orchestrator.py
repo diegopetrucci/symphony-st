@@ -723,8 +723,10 @@ class Orchestrator:
                 # tickets with actual new human comments will get an agent turn.
                 # _reconcile_serve on the next tick kills the serve when the ticket
                 # leaves QA.  Recovery of a working ticket, however, is unconditional
-                # (no comment gating), so it is skipped when the ticket is in QA, no
-                # longer triggered, or cleanup-refused — those tickets are left alone.
+                # (no comment gating), so untriggered and cleanup-refused tickets are
+                # left alone.  A QA ticket is left alone only while its task is in
+                # flight; a stale QA entry is parked in needs_input, where a human
+                # comment can reach it again.
 
                 if st == TicketStatus.failed and ticket_state.setup_error is not None:
                     continue
@@ -748,7 +750,37 @@ class Orchestrator:
                         )
                         continue
                     if self._tracker.is_in_qa(fetched):
-                        logger.debug("Skipping recovery for working QA ticket %s", tid)
+                        if self._is_task_in_flight(tid):
+                            logger.debug(
+                                "Skipping recovery for working QA ticket %s: task in flight",
+                                tid,
+                            )
+                            continue
+
+                        repaired = False
+                        with self._state_lock:
+                            state_entry = self._state.get(tid)
+                            if (
+                                state_entry is not None
+                                and state_entry.status == TicketStatus.working
+                            ):
+                                # Without this write, the ticket stays working forever and
+                                # tick step 4 never reaches the needs_input/failed resume
+                                # branch for new human comments.
+                                state_entry.status = TicketStatus.needs_input
+                                state_entry.updated_at = _iso_now()
+                                self._state.upsert(state_entry)
+                                self._state.save()
+                                repaired = True
+                        if repaired:
+                            logger.info(
+                                "Repaired stale working QA ticket %s to needs_input",
+                                tid,
+                            )
+                        else:
+                            logger.debug(
+                                "Skipping recovery for working QA ticket %s", tid
+                            )
                         continue
                     if self._is_task_in_flight(tid):
                         # A turn is genuinely running right now (as opposed to a
@@ -933,6 +965,36 @@ class Orchestrator:
                 winner.identifier,
             )
             self._cancel_ticket(winner_id)
+
+            made_resumable = False
+            with self._state_lock:
+                state_entry = self._state.get(winner_id)
+                if state_entry is not None and state_entry.status in (
+                    TicketStatus.working,
+                    TicketStatus.bootstrapping,
+                ):
+                    # Without this write the ticket stays working forever and
+                    # tick step 4 never reaches the needs_input/failed resume
+                    # branch that reads new human comments.  The write lives
+                    # here rather than in the pipelines' AgentCancelled
+                    # handler because that handler also runs on daemon
+                    # shutdown (where needs_input would disarm restart
+                    # recovery) and on ticket cleanup (where it would
+                    # resurrect a removed entry).  get() returns the live
+                    # entry, so no upsert is needed.
+                    state_entry.status = TicketStatus.needs_input
+                    state_entry.updated_at = _iso_now()
+                    self._state.save()
+                    made_resumable = True
+            if made_resumable:
+                self._post_comment_safe(
+                    winner_id,
+                    (
+                        "**Symphony**: The running turn was stopped because this ticket "
+                        "entered QA. A reply on this ticket will continue the work."
+                    ),
+                    kind="qa",
+                )
 
         logger.info(
             "Starting QA serve for %s (workspace=%s)", winner.identifier, workspace_path
@@ -1638,8 +1700,9 @@ class Orchestrator:
                 self._state.upsert(ticket_state)
                 self._state.save()
             return
-        except AgentCancelled:
+        except AgentCancelled as exc:
             logger.info("Agent turn cancelled for %s", tid)
+            self._salvage_cancelled_session(tid, exc.session_id)
             return
         except AgentError as exc:
             logger.error("Agent failed for %s: %s", tid, exc)
@@ -1970,8 +2033,9 @@ class Orchestrator:
                 self._state.upsert(ticket_state)
                 self._state.save()
             return
-        except AgentCancelled:
+        except AgentCancelled as exc:
             logger.info("Agent resume cancelled for %s", tid)
+            self._salvage_cancelled_session(tid, exc.session_id)
             return
         except AgentError as exc:
             logger.error("Agent resume failed for %s: %s", tid, exc)
@@ -2035,6 +2099,29 @@ class Orchestrator:
     # ==================================================================
     # Shared helpers
     # ==================================================================
+
+    def _salvage_cancelled_session(self, tid: str, session_id: str | None) -> None:
+        """Keep a killed turn's session id so the next turn can resume it.
+
+        Writes only session_id/agent, never status: the QA path in
+        _reconcile_serve is the other writer of this entry.  The entry is
+        mutated in place and never upserted — step-3 cleanup removes entries
+        without holding _state_lock, and upsert appends an absent id, so an
+        upsert here could resurrect a ticket whose workspace is already gone.
+        """
+        if session_id is None:
+            return
+
+        with self._state_lock:
+            state_entry = self._state.get(tid)
+            if state_entry is None or state_entry.session_id is not None:
+                return
+
+            state_entry.session_id = session_id
+            state_entry.agent = self._config.agent
+            state_entry.updated_at = _iso_now()
+            self._state.save()
+            logger.info("Saved cancelled agent session for %s", tid)
 
     def _session_matches_current_agent(self, agent: str | None) -> bool:
         """Whether a recorded session can be handed to the configured agent.

@@ -834,10 +834,15 @@ class TestExecuteExitErrors:
         assert "loading path" not in msg
 
     def test_signal_exit_raises_open_code_cancelled(self) -> None:
-        """A negative return code remains distinct from an agent failure."""
-        proc = _FakePopen(exit_code=-9)
+        """A signal exit retains a parsed session ID for recovery."""
+        proc = _FakePopen(
+            stdout=(FIXTURE_DIR / "opencode_events.jsonl").read_bytes(),
+            exit_code=-9,
+        )
         with patch("symphony_linear.agent_runner.run_in_sandbox", return_value=proc):
-            with pytest.raises(OpenCodeCancelled, match="killed by signal 9"):
+            with pytest.raises(
+                OpenCodeCancelled, match="killed by signal 9"
+            ) as excinfo:
                 run_initial(
                     workspace_path="/ws",
                     tmp_path="/ws/tmp",
@@ -846,6 +851,8 @@ class TestExecuteExitErrors:
                     idle_timeout_seconds=10,
                     on_subprocess=lambda p: None,
                 )
+
+        assert excinfo.value.session_id == "ses_1e3790378ffecZySU3wIpFOoIz"
 
 
 class TestOpenCodeTimeoutAttributes:

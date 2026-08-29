@@ -289,8 +289,20 @@ class TestExitValidation:
             "symphony_linear.omp.agent_runner.run",
             return_value=(-9, "not NDJSON", "", None),
         ):
-            with pytest.raises(OMPCancelled, match="killed by signal 9"):
+            with pytest.raises(OMPCancelled, match="killed by signal 9") as excinfo:
                 _run_initial()
+
+        assert excinfo.value.session_id is None
+
+    def test_signal_exit_carries_parsed_session_id(self) -> None:
+        with patch(
+            "symphony_linear.omp.agent_runner.run",
+            return_value=(-9, _fixture_text(), "", None),
+        ):
+            with pytest.raises(OMPCancelled, match="killed by signal 9") as excinfo:
+                _run_initial()
+
+        assert excinfo.value.session_id == "01a035ff-248a-735c-8173-f5ee428fe917"
 
     def test_nonzero_exit_wins_over_missing_session_and_keeps_stderr_tail(self) -> None:
         stderr = "bootstrap-start\n" + ("padding\n" * 1000) + "actual failure\n"

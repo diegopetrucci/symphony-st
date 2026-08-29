@@ -85,7 +85,16 @@ shutting down, or the ticket is no longer triggered — see `_is_still_triggered
   comments on a ticket in `qa_state` also trigger the normal resume pipeline:
   the ticket is transitioned to `in_progress_state`, the agent runs, the
   ticket lands in `needs_input_state`, and the existing `_reconcile_serve`
-  logic kills the active serve on the next tick because its owner left QA.
+  logic kills the active serve on the next tick because its owner left QA. This
+  still holds when a ticket enters QA mid-turn: `_reconcile_serve` cancels the
+  in-flight turn and, for a `working` or `bootstrapping` state entry, parks the
+  daemon status at `TicketStatus.needs_input` with one `qa`-kind
+  reply-to-continue comment while deliberately leaving the tracker ticket in
+  QA. Tick step 4 repairs a stale `working` + in-QA entry to
+  `TicketStatus.needs_input` instead of skipping it. The repair starts no
+  turn, so the normal comment-gated resume pipeline runs on the following tick
+  when a session id is available; without one, the existing fresh-start branch
+  handles the reply.
 - **The bot's own comments are filtered out** via a visible Markdown footer
   of the form `*Symphony · {kind}*` appended at the tracker-adapter layer
   from a `kind` string supplied by the caller (e.g. `"workspace"`, `"final"`,
@@ -148,6 +157,14 @@ shutting down, or the ticket is no longer triggered — see `_is_still_triggered
   path keeps the full `_assemble_message` trace — every `"text"` segment
   plus one `*tool title*` line per tool call — because it is the only
   diagnostic on a killed turn. Other event types are intentionally ignored.
+  `AgentCancelled` carries a parsed session id when available, and the
+  orchestrator salvages it (plus the current agent tag) only into a
+  still-present state entry with no session id, without changing its status.
+  Thus a killed first turn with a later reply resumes instead of restarting.
+  OMP emits a `session` event as its first stdout line before any model work,
+  so its id is normally available immediately. OpenCode's id first appears on
+  the first event carrying `sessionID` (`step_start`); a kill before that
+  produces `None` and follows the existing fresh-start path.
 - **OMP namespaces sessions by cwd path**, under
   `~/.omp/agent/sessions/<slugified-cwd>/`, exactly like OpenCode. Moving a
   repo path therefore breaks resume for either agent; retain the per-ticket
@@ -197,9 +214,9 @@ shutting down, or the ticket is no longer triggered — see `_is_still_triggered
   triggering comment, so that comment is deliberately not replayed — the
   human must reply again. The counter is reset to 0 only when a turn starts
   from genuinely new input (the pipelines do this alongside
-  `status = working`), and recovery only fires for tickets that are still in
-  the tick's trigger list and not cleanup-refused, so QA tickets,
-  untriggered tickets, and dirty-workspace refusals are left alone.
+  `status = working`), and the recovery re-run only fires for tickets that are
+  still in the tick's trigger list and not cleanup-refused, so untriggered
+  tickets and dirty-workspace refusals are left alone.
 - **Mid-turn comments are explicitly discarded, not queued.** A human
   comment posted while a turn is genuinely running (a task is in flight in
   `_active_tasks`) is never consumed by that turn, so tick step 4 posts one
@@ -240,13 +257,14 @@ shutting down, or the ticket is no longer triggered — see `_is_still_triggered
   time makes a comment posted moments before the turn starts exactly the one
   that misclassifies. The marker is in-memory by design: on restart the map
   is empty, nothing warns, and recovery behaves exactly as it does today.
-  Accepted consequence of the read-only warning: on turn paths that return
-  without an end-of-turn `last_seen_comment_id` write (OpenCodeCancelled
-  and the `_is_cancelled` early returns), a warned comment stays pending
-  and a later turn may consume it, so the agent can end up reading a
-  comment it said it did not read. Those paths mean the ticket was moved to
-  QA or untriggered, the comment is the human's own instruction, and acting
-  on it late is harmless. Preserving restart recovery is worth more.
+  Accepted consequence of the read-only warning: on a turn path that returns
+  without an end-of-turn `last_seen_comment_id` write (`AgentCancelled` or an
+  `_is_cancelled` early return), a warned comment remains pending. In the QA
+  case, `_reconcile_serve` parks the cancelled `working`/`bootstrapping` entry
+  at `TicketStatus.needs_input` without touching `last_seen_comment_id`, so
+  the next turn on a human reply consumes the pending comments. An untriggered
+  ticket is left alone; preserving restart recovery is worth more than
+  suppressing that late read.
 - **No auto-retry on failure.** A failed ticket goes to `TicketStatus.failed`
   and only retries if the user comments (resume path) or if there's no
   session id yet (re-runs the initial pipeline). The internal status and the
@@ -267,13 +285,18 @@ shutting down, or the ticket is no longer triggered — see `_is_still_triggered
   and stores the Popen in `Orchestrator._active_serve` (an `_ActiveServe`
   dataclass). At most one serve runs across the whole daemon. The newest QA
   entrant always wins — incumbents are killed and bumped back to
-  `needs_input_state`. Nothing about the serve is persisted to `state.json`;
-  on daemon restart the reconciliation loop sees the ticket still in
-  `qa_state` and relaunches the serve naturally. A serve that dies (within
-  or after the 10s watchdog window) gets a tracker comment with the rc and a
-  stdout/stderr tail, and the ticket is transitioned back to
-  `needs_input_state` to avoid a respawn loop — except clean exits within
-  10s, which are silent (the script is assumed to have daemonized a child).
+  `needs_input_state`. When a winner has an in-flight agent turn,
+  `_reconcile_serve` cancels it before starting the serve. For a `working` or
+  `bootstrapping` state entry, the cancellation parks the internal status at
+  `TicketStatus.needs_input` and posts one `qa`-kind comment telling the human
+  to reply to continue; it deliberately leaves the tracker ticket in QA.
+  Nothing about the serve is persisted to `state.json`; on daemon restart the
+  reconciliation loop sees the ticket still in `qa_state` and relaunches the
+  serve naturally. A serve that dies (within or after the 10s watchdog window)
+  gets a tracker comment with the rc and a stdout/stderr tail, and the ticket
+  is transitioned back to `needs_input_state` to avoid a respawn loop — except
+  clean exits within 10s, which are silent (the script is assumed to have
+  daemonized a child).
 - **Model override via `Model: <value>` labels, two tiers.** Resolved per
   turn from the freshly fetched issue by `model_for_issue` in `tracker.py`:
   the issue's own labels first, then `issue.project.labels` (a `None`

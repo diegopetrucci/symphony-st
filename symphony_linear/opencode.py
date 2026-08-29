@@ -491,7 +491,9 @@ def _execute(
     # Detect external kill (negative returncode = killed by signal).
     # Check this before non-zero exit so we can distinguish.
     if returncode is not None and returncode < 0:
-        raise OpenCodeCancelled(f"OpenCode process killed by signal {-returncode}")
+        raise OpenCodeCancelled(
+            f"OpenCode process killed by signal {-returncode}", session_id=session_id
+        )
 
     if returncode != 0:
         raise OpenCodeError(

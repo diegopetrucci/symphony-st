@@ -25,6 +25,7 @@ from symphony_linear.linear import (
 )
 from symphony_linear.linear_tracker import LinearTracker
 from symphony_linear.opencode import (
+    OpenCodeCancelled,
     OpenCodeError,
     OpenCodeTimeout,
 )
@@ -670,6 +671,117 @@ class TestNewTicketPipeline:
         assert ts.status == TicketStatus.failed
         assert ts.session_id == "ses_salvaged"
         assert ts.agent == "opencode"
+
+    def test_cancelled_turn_persists_salvaged_session_id(
+        self,
+        orchestrator: Orchestrator,
+        linear: FakeLinearClient,
+        state_mgr: StateManager,
+    ) -> None:
+        """Cancellation saves the parsed session without changing state status."""
+        with (
+            mock.patch("symphony_linear.orchestrator.clone_workspace") as mock_clone,
+            mock.patch(
+                "symphony_linear.orchestrator.finalize_workspace"
+            ) as mock_finalize,
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config"
+            ) as mock_load_config,
+            mock.patch("symphony_linear.orchestrator.run_initial") as mock_run_initial,
+        ):
+            issue = self._setup_mocks(
+                mock_clone, mock_finalize, mock_load_config, mock_run_initial, linear
+            )
+            mock_run_initial.side_effect = OpenCodeCancelled(
+                "cancelled", session_id="ses-cancelled"
+            )
+
+            orchestrator._new_ticket_pipeline(issue)
+
+        state_mgr.load()
+        state_entry = state_mgr.get("ticket-1")
+        assert state_entry is not None
+        assert state_entry.session_id == "ses-cancelled"
+        assert state_entry.agent == "opencode"
+        assert state_entry.status == TicketStatus.working
+        assert ("ticket-1", "Needs Input") not in linear.calls.get(
+            "transition_to_state", []
+        )
+
+    def test_cancelled_turn_does_not_resurrect_removed_state(
+        self,
+        orchestrator: Orchestrator,
+        linear: FakeLinearClient,
+        state_mgr: StateManager,
+    ) -> None:
+        """Cancellation after cleanup must not reinsert the removed ticket."""
+
+        def remove_state_then_cancel(
+            *args: Any, **kwargs: Any
+        ) -> tuple[str, str, int | None]:
+            orchestrator._cancel_ticket("ticket-1")
+            assert orchestrator._state.remove("ticket-1")
+            orchestrator._state.save()
+            raise OpenCodeCancelled("cancelled", session_id="ses-cancelled")
+
+        with (
+            mock.patch("symphony_linear.orchestrator.clone_workspace") as mock_clone,
+            mock.patch(
+                "symphony_linear.orchestrator.finalize_workspace"
+            ) as mock_finalize,
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config"
+            ) as mock_load_config,
+            mock.patch(
+                "symphony_linear.orchestrator.run_initial",
+                side_effect=remove_state_then_cancel,
+            ) as mock_run_initial,
+        ):
+            issue = self._setup_mocks(
+                mock_clone, mock_finalize, mock_load_config, mock_run_initial, linear
+            )
+            orchestrator._new_ticket_pipeline(issue)
+
+        state_mgr.load()
+        assert state_mgr.get("ticket-1") is None
+
+    def test_cancelled_turn_does_not_resurrect_state_removed_during_salvage(
+        self,
+        orchestrator: Orchestrator,
+        linear: FakeLinearClient,
+        state_mgr: StateManager,
+    ) -> None:
+        """A cleanup interleave cannot reinsert the detached state entry."""
+
+        def remove_state_during_timestamp() -> str:
+            assert orchestrator._state.remove("ticket-1")
+            return "2025-06-01T00:00:00+00:00"
+
+        with (
+            mock.patch("symphony_linear.orchestrator.clone_workspace") as mock_clone,
+            mock.patch(
+                "symphony_linear.orchestrator.finalize_workspace"
+            ) as mock_finalize,
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config"
+            ) as mock_load_config,
+            mock.patch("symphony_linear.orchestrator.run_initial") as mock_run_initial,
+            mock.patch(
+                "symphony_linear.orchestrator._iso_now",
+                side_effect=remove_state_during_timestamp,
+            ) as mock_iso_now,
+        ):
+            issue = self._setup_mocks(
+                mock_clone, mock_finalize, mock_load_config, mock_run_initial, linear
+            )
+            mock_run_initial.side_effect = OpenCodeCancelled(
+                "cancelled", session_id="ses-cancelled"
+            )
+            orchestrator._new_ticket_pipeline(issue)
+
+        mock_iso_now.assert_called_once()
+        state_mgr.load()
+        assert state_mgr.get("ticket-1") is None
 
     def test_opencode_timeout_comment_includes_partial_output(
         self, orchestrator: Orchestrator, linear: FakeLinearClient
@@ -2261,6 +2373,38 @@ class TestResumePipeline:
         )
         assert "Bot" not in msg  # filtered because body contains sentinel
         assert "Human" in msg
+
+    def test_cancelled_resume_does_not_overwrite_existing_session(
+        self,
+        orchestrator: Orchestrator,
+        linear: FakeLinearClient,
+        state_mgr: StateManager,
+    ) -> None:
+        """A cancelled resume keeps an existing session and its legacy agent tag."""
+        ticket_state = self._make_ts(session_id="ses-existing", agent=None)
+        orchestrator._state.upsert(ticket_state)
+        linear.set_response("list_comments_since", [_make_comment("c1", "Continue")])
+
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config",
+                return_value=ProjectConfig(),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.run_resume",
+                side_effect=OpenCodeCancelled(
+                    "cancelled", session_id="ses-replacement"
+                ),
+            ),
+        ):
+            orchestrator._resume_pipeline(ticket_state)
+
+        state_mgr.load()
+        state_entry = state_mgr.get("ticket-1")
+        assert state_entry is not None
+        assert state_entry.session_id == "ses-existing"
+        assert state_entry.agent is None
+        assert state_entry.status == TicketStatus.working
 
     def test_resume_timeout_advances_last_seen(
         self, orchestrator: Orchestrator, linear: FakeLinearClient
@@ -4053,13 +4197,13 @@ class TestTick:
     # and handles its own early-return. _rerun_interrupted_turn is still
     # skipped for QA tickets (it has no comment gating).
 
-    def test_working_ticket_in_qa_state_not_scheduled(
+    def test_stale_working_qa_ticket_repaired_without_scheduling(
         self,
         tmp_path: Path,
         state_mgr: StateManager,
         linear: FakeLinearClient,
     ) -> None:
-        """status=working + linear_state=qa_state → _rerun_interrupted_turn NOT scheduled."""
+        """A stale working QA ticket waits for a human reply instead of a recovery turn."""
         config = _make_config(tmp_path, linear={"qa_state": "In Review"})
         orch = Orchestrator(
             config=config,
@@ -4076,20 +4220,25 @@ class TestTick:
             branch="main",
             status=TicketStatus.working,
             session_id="ses-abc",
+            last_seen_comment_id="cmt-seen-1",
         )
         orch._state.upsert(ts)
 
         qa_issue = _make_issue(id="ticket-1", state="In Review", labels=["Agent"])
         linear.set_response("list_triggered_issues", [qa_issue])
 
-        with mock.patch(
-            "symphony_linear.orchestrator.start_serve", return_value=_make_fake_proc()
+        with (
+            mock.patch.object(orch, "_reconcile_serve"),
+            mock.patch.object(orch, "_schedule_task") as m_schedule,
         ):
-            with mock.patch.object(orch, "_rerun_interrupted_turn") as m_recover:
-                orch._tick()
-                time.sleep(0.2)
+            orch._tick()
 
-        m_recover.assert_not_called()
+        m_schedule.assert_not_called()
+        updated = orch._state.get("ticket-1")
+        assert updated is not None
+        assert updated.status == TicketStatus.needs_input
+        assert updated.last_seen_comment_id == "cmt-seen-1"
+        assert linear.calls.get("post_comment", []) == []
 
     def test_failed_with_session_in_qa_state_resume_scheduled(
         self,
@@ -4778,13 +4927,13 @@ class TestTick:
         m_rerun.assert_not_called()
         assert self._posted_bodies(linear) == []
 
-    def test_working_in_flight_in_qa_no_warn(
+    def test_working_in_flight_in_qa_is_left_alone(
         self,
         tmp_path: Path,
         state_mgr: StateManager,
         linear: FakeLinearClient,
     ) -> None:
-        """In-flight task + ticket in qa_state → the QA guard wins, no warn."""
+        """Tick step 4 does not repair or comment on a genuinely running QA turn."""
         config = _make_config(tmp_path, linear={"qa_state": "In Review"})
         orch = Orchestrator(
             config=config,
@@ -4807,18 +4956,18 @@ class TestTick:
         orch._active_tasks["ticket-1"] = Future()
 
         with (
+            mock.patch.object(orch, "_reconcile_serve"),
             mock.patch.object(orch, "_warn_ignored_comments") as m_warn,
-            mock.patch.object(orch, "_rerun_interrupted_turn") as m_rerun,
-            mock.patch(
-                "symphony_linear.orchestrator.start_serve",
-                return_value=_make_fake_proc(),
-            ),
+            mock.patch.object(orch, "_schedule_task") as m_schedule,
         ):
             orch._tick()
-            time.sleep(0.2)
 
         m_warn.assert_not_called()
-        m_rerun.assert_not_called()
+        m_schedule.assert_not_called()
+        updated = orch._state.get("ticket-1")
+        assert updated is not None
+        assert updated.status == TicketStatus.working
+        assert updated.last_seen_comment_id == "cmt-seen-1"
         assert self._posted_bodies(linear) == []
 
     def test_working_in_flight_input_not_fixed_no_warn(
@@ -6328,13 +6477,13 @@ class TestReconcileServe:
         post_calls = linear.calls.get("post_comment", [])
         assert any("ticket-1" == tid for tid, _ in post_calls)
 
-    def test_qa_ticket_with_human_comment_triggers_resume(
+    def test_qa_ticket_with_human_comment_resumes_to_in_progress(
         self,
         tmp_path: Path,
         state_mgr: StateManager,
         linear: FakeLinearClient,
     ) -> None:
-        """QA-state ticket with a new human comment triggers _resume_pipeline."""
+        """A QA ticket in needs_input resumes normally when a human comments."""
         config = _make_qa_config(tmp_path)
         orch = Orchestrator(
             config=config,
@@ -6349,14 +6498,26 @@ class TestReconcileServe:
         linear.set_response("list_triggered_issues", [qa_issue])
         linear.set_response("list_comments_since", [_make_comment("c1", "LGTM")])
 
-        with mock.patch(
-            "symphony_linear.orchestrator.start_serve", return_value=_make_fake_proc()
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.start_serve",
+                return_value=_make_fake_proc(),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config",
+                return_value=ProjectConfig(),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.run_resume", return_value=("Done!", None)
+            ) as m_run_resume,
         ):
-            with mock.patch.object(orch, "_resume_pipeline") as m_resume:
-                orch._tick()
-                time.sleep(0.2)
+            orch._tick()
+            time.sleep(0.2)
 
-        m_resume.assert_called_once()
+        m_run_resume.assert_called_once()
+        assert ("ticket-1", "In Progress") in linear.calls.get(
+            "transition_to_state", []
+        )
 
     def test_start_serve_raises_serve_script_missing(
         self,
@@ -7186,13 +7347,13 @@ class TestFix4Drainer:
 
 
 class TestCorrection3:
-    def test_inflight_task_cancelled_before_serve_starts(
+    def test_inflight_working_task_cancelled_for_qa_becomes_resumable(
         self,
         tmp_path: Path,
         state_mgr: StateManager,
         linear: FakeLinearClient,
     ) -> None:
-        """_reconcile_serve cancels an in-flight agent task before starting the serve."""
+        """QA cancellation parks a working turn without moving the tracker ticket."""
         config = _make_qa_config(tmp_path)
         orch = Orchestrator(
             config=config,
@@ -7200,7 +7361,7 @@ class TestCorrection3:
             tracker=LinearTracker(linear=linear, config=config.linear),
             workspace=tmp_path / "ws",
         )  # type: ignore[arg-type]
-        _add_ticket_state(orch)
+        _add_ticket_state(orch, status=TicketStatus.working)
 
         # Simulate an in-flight task: insert a non-done Future into _active_tasks
         # and a running subprocess into _subprocesses.
@@ -7215,19 +7376,44 @@ class TestCorrection3:
         issue = _make_qa_issue()
         new_proc = _make_fake_proc(returncode=None)
 
-        with mock.patch(
-            "symphony_linear.orchestrator.start_serve", return_value=new_proc
-        ) as m_serve:
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.start_serve", return_value=new_proc
+            ) as m_serve,
+            mock.patch.object(
+                orch, "_post_comment_safe", wraps=orch._post_comment_safe
+            ) as m_comment,
+        ):
             orch._reconcile_serve([issue], {issue.id: issue})
 
-        # The in-flight agent subprocess was killed.
+        # The in-flight agent subprocess was killed and the serve was started.
         assert agent_proc.returncode is not None, "agent proc should have been killed"
-        # The cancellation flag was set.
         assert orch._is_cancelled("ticket-1")
-        # The serve was still started.
         m_serve.assert_called_once()
         assert orch._active_serve is not None
         assert orch._active_serve.ticket_id == "ticket-1"
+
+        updated = orch._state.get("ticket-1")
+        assert updated is not None
+        assert updated.status == TicketStatus.needs_input
+        assert updated.last_seen_comment_id == "cmt-seen-1"
+        assert linear.calls.get("transition_to_state", []) == []
+
+        m_comment.assert_called_once_with(
+            "ticket-1",
+            (
+                "**Symphony**: The running turn was stopped because this ticket "
+                "entered QA. A reply on this ticket will continue the work."
+            ),
+            kind="qa",
+        )
+        posted = [
+            body
+            for ticket_id, body in linear.calls.get("post_comment", [])
+            if ticket_id == "ticket-1"
+        ]
+        assert len(posted) == 1
+        assert "*Symphony · qa*" in posted[0]
 
     def test_no_inflight_task_serve_starts_normally(
         self,

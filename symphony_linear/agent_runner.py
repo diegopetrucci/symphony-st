@@ -65,6 +65,10 @@ class AgentTimeout(Exception):
 class AgentCancelled(Exception):
     """An agent process was killed externally."""
 
+    def __init__(self, message: str, session_id: str | None = None) -> None:
+        super().__init__(message)
+        self.session_id = session_id
+
 
 def run(
     cmd: list[str],

@@ -190,7 +190,9 @@ def _execute(
     # Preserve the runner's cancellation distinction before handling a generic
     # non-zero exit, then validate protocol essentials before assembling text.
     if returncode is not None and returncode < 0:
-        raise OMPCancelled(f"OMP process killed by signal {-returncode}")
+        raise OMPCancelled(
+            f"OMP process killed by signal {-returncode}", session_id=session_id
+        )
 
     if returncode != 0:
         raise OMPError(
