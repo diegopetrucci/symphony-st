@@ -28,11 +28,19 @@ from symphony_linear.omp import (
 )
 
 FIXTURE_PATH = Path(__file__).resolve().parent / "fixtures" / "omp_events.jsonl"
+ERROR_FIXTURE_PATH = (
+    Path(__file__).resolve().parent / "fixtures" / "omp_error_events.jsonl"
+)
 
 
 def _fixture_text() -> str:
     """Return the captured OMP NDJSON stream for a completed simple turn."""
     return FIXTURE_PATH.read_text()
+
+
+def _error_fixture_text() -> str:
+    """Return an OMP stream whose retries all end in a provider failure."""
+    return ERROR_FIXTURE_PATH.read_text()
 
 
 class TestCapturedEvents:
@@ -315,6 +323,44 @@ class TestExitValidation:
 
         assert "actual failure" in str(excinfo.value)
         assert "bootstrap-start" not in str(excinfo.value)
+
+    def test_zero_exit_error_turn_raises_last_provider_error(self) -> None:
+        with patch(
+            "symphony_linear.omp.agent_runner.run",
+            return_value=(0, _error_fixture_text(), "", None),
+        ):
+            with pytest.raises(OMPError) as excinfo:
+                _run_initial()
+
+        message = str(excinfo.value)
+        assert "429 provider rate limit persisted after final retry" in message
+        assert "429 retry attempt 3 failed" not in message
+
+    def test_zero_exit_aborted_turn_is_an_error(self) -> None:
+        stdout = (
+            '{"type":"session","id":"omp-aborted-session"}\n'
+            '{"type":"turn_end","message":{"stopReason":"aborted",'
+            '"errorMessage":"request aborted"}}'
+        )
+        with patch(
+            "symphony_linear.omp.agent_runner.run",
+            return_value=(0, stdout, "", None),
+        ):
+            with pytest.raises(OMPError, match="request aborted"):
+                _run_initial()
+
+    def test_signal_exit_wins_over_terminal_aborted_turn(self) -> None:
+        stdout = (
+            '{"type":"session","id":"omp-aborted-session"}\n'
+            '{"type":"turn_end","message":{"stopReason":"aborted",'
+            '"errorMessage":"request aborted"}}'
+        )
+        with patch(
+            "symphony_linear.omp.agent_runner.run",
+            return_value=(-9, stdout, "", None),
+        ):
+            with pytest.raises(OMPCancelled, match="killed by signal 9"):
+                _run_initial()
 
     def test_zero_exit_without_session_is_an_error(self) -> None:
         with patch(

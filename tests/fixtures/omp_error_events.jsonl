@@ -1,0 +1,5 @@
+{"type":"session","id":"omp-error-session"}
+{"type":"turn_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"429 retry attempt 1 failed"}}
+{"type":"turn_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"429 retry attempt 2 failed"}}
+{"type":"turn_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"429 retry attempt 3 failed"}}
+{"type":"turn_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"429 provider rate limit persisted after final retry"}}
