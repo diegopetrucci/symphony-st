@@ -289,17 +289,20 @@ directly; that is often nicer for systemd or secret managers.
 ### Coding agent
 
 The optional top-level `agent` key selects the coding-agent CLI for the
-daemon. It accepts `opencode` (the default) or `omp`:
+daemon. It accepts `opencode` (the default), `omp`, or `pi`:
 
 ```yaml
 agent: omp
 ```
 
-The selected binary must be on the sandbox's `$PATH`. The sandbox uses
-`SYMPHONY_SANDBOX_PATH` when it is set, otherwise it uses the daemon's
-`$PATH`. Agents do not share sessions: changing `agent` makes a ticket with a
-session from the other agent start a fresh session on its next turn instead of
-resuming the old one.
+The selected binary (`opencode`, `omp`, or `pi`) must be on the sandbox's
+`$PATH`. The sandbox uses `SYMPHONY_SANDBOX_PATH` when it is set, otherwise it
+uses the daemon's `$PATH`. Agents do not share sessions: changing `agent` makes
+a ticket with a session from a different agent start a fresh session on its next
+turn instead of resuming the old one.
+
+`pi` keeps credentials in `~/.pi/agent/auth.json`, a separate vault from OMP's:
+authenticating OMP does not authenticate pi.
 
 ### Full annotated config
 
@@ -310,7 +313,7 @@ documented there side by side.
 ```yaml
 # config.yaml (placed in the workspace directory)
 
-# Coding-agent CLI to run (default: opencode). Must be `opencode` or `omp`.
+# Coding-agent CLI to run (default: opencode). Must be `opencode`, `omp`, or `pi`.
 agent: opencode
 
 # Choose exactly one backend — linear or github.

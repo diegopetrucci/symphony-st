@@ -33,14 +33,15 @@ subprocess inside `bwrap`).
 - Runtime deps: `pyyaml`, `pydantic` v2, `httpx`.
 - Dev deps: `pytest`.
 - External binaries required at runtime: `bwrap`, `git`, and the selected
-  coding-agent CLI (`opencode` or `omp`).
+  coding-agent CLI (`opencode`, `omp`, or `pi`).
 - CLI entry point: `symphony` → `symphony_linear.cli:main`.
 - Backends: the orchestrator talks to a `Tracker` protocol (see `tracker.py`).
   Concrete implementations exist for Linear (`linear_tracker.py`) and
   GitHub Projects v2 (`github_tracker.py`). Exactly one backend is active
   per daemon, selected at config time.
-- Coding-agent adapters: OpenCode (`opencode.py`) and OMP (`omp.py`). Exactly
-  one coding-agent CLI is active per daemon, selected at config time.
+- Coding-agent adapters: OpenCode (`opencode.py`) and the pi family: OMP
+  (`omp.py`) and pi (`pi.py`), sharing `pi_protocol.py`. Exactly one
+  coding-agent CLI is active per daemon, selected at config time.
 
 ## Layout
 
@@ -57,12 +58,14 @@ symphony_linear/
   sandbox.py        Single function: run_in_sandbox() → builds the bwrap argv and returns a Popen
   agent_runner.py   Shared sandbox process runner; drains pipes and enforces turn watchdogs
   opencode.py       OpenCode adapter: run_initial / run_resume; parses OpenCode NDJSON
-  omp.py            OMP adapter: run_initial / run_resume; parses OMP NDJSON
+  pi_protocol.py    Shared pi-family JSON parser for OMP and pi
+  omp.py            OMP adapter: run_initial / run_resume; shared pi-family parser
+  pi.py             pi adapter: run_initial / run_resume; shared pi-family parser
   workspace.py      prepare() / remove(): clone, branch switch, .symphony/setup; path-containment check
   orchestrator.py   The brain: poll loop, per-ticket pipelines, ThreadPoolExecutor, cancellation
   webhook.py        Optional webhook receiver; wakes poll loop on Linear updates. Absent config means polling only.
   logging.py        stderr logging setup
-tests/              pytest, mostly unit with mocks; integration tests marked `integration` (shell out to `bwrap`/`git` — they never call the real `opencode` or `omp` binary or any LLM)
+tests/              pytest, mostly unit with mocks; integration tests marked `integration` (shell out to `bwrap`/`git` — they never call the real `opencode`, `omp`, or `pi` binary or any LLM)
 ```
 
 The flow worth knowing: `orchestrator._tick()` is called every
@@ -143,10 +146,16 @@ shutting down, or the ticket is no longer triggered — see `_is_still_triggered
   create mount points under the read-only root bind); `run_in_sandbox` only
   emits argv from the resolved pairs. Git ops run
   *outside* the sandbox using the daemon's credentials; the selected coding
-  agent and `.symphony/setup` run *inside*. OpenCode's session directories
-  and OMP's `~/.omp` are deliberate read-write binds. OMP's auth vault and
-  run/daemons directory both live under `~/.omp`; `PI_CODING_AGENT_DIR` does
-  not redirect the run/ path.
+  agent and `.symphony/setup` run *inside*. OpenCode's session directories and
+  the pi family's `~/.omp` and `~/.pi` are deliberate read-write binds. OMP's
+  auth vault and run/daemons directory both live under `~/.omp`;
+  `PI_CODING_AGENT_DIR` does not redirect OMP's `run/` path. pi's state lives
+  under `~/.pi/agent/` and its credential vault is separate from OMP's —
+  authenticating one does not authenticate the other. Upstream pi honours
+  `PI_CODING_AGENT_DIR`, but it has no effect here: `run_in_sandbox` passes
+  `--clearenv` and the adapters set only `HOME` (plus `PATH`), so a sandboxed
+  pi always resolves its state to `~/.pi`, which is why that exact path is the
+  one bound read-write.
 - **The OpenCode session id is captured from the first NDJSON event** that
   includes `sessionID`; that value is the main session and any event whose
   top-level `sessionID` differs is subagent chatter. The final assistant
@@ -161,26 +170,43 @@ shutting down, or the ticket is no longer triggered — see `_is_still_triggered
   orchestrator salvages it (plus the current agent tag) only into a
   still-present state entry with no session id, without changing its status.
   Thus a killed first turn with a later reply resumes instead of restarting.
-  OMP emits a `session` event as its first stdout line before any model work,
-  so its id is normally available immediately. OpenCode's id first appears on
-  the first event carrying `sessionID` (`step_start`); a kill before that
-  produces `None` and follows the existing fresh-start path.
-- **OMP namespaces sessions by cwd path**, under
-  `~/.omp/agent/sessions/<slugified-cwd>/`, exactly like OpenCode. Moving a
-  repo path therefore breaks resume for either agent; retain the per-ticket
-  workspace path across turns.
-- **OMP prompts are unconditionally prefixed with a newline.** Any message
-  argv beginning with `@` is an attachment, so OMP exits 1 with "File not
-  found" for ticket text that starts with `@developer`. The prefix is applied
-  in both paths even when the prompt already starts with a newline.
+  The pi family (OMP and pi) emits a `session` event as its first stdout line
+  before any model work, so its id is normally available immediately.
+  OpenCode's id first appears on the first event carrying `sessionID`
+  (`step_start`); a kill before that produces `None` and follows the existing
+  fresh-start path.
+- **pi is OMP's upstream and their JSON protocols are byte-compatible.**
+  `omp.py` and `pi.py` share `pi_protocol.py`; only their argv differs. Do not
+  split the parser.
+- **The pi family namespaces sessions by cwd path**, under
+  `~/.omp/agent/sessions/<slugified-cwd>/` for OMP and
+  `~/.pi/agent/sessions/<slugified-cwd>/` for pi, exactly like OpenCode.
+  Moving a repo path therefore breaks resume for all agents; retain the
+  per-ticket workspace path across turns.
+- **The pi family's prompts are unconditionally prefixed with a newline.** Any
+  message argv beginning with `@` is an attachment, so OMP or pi exits 1 with
+  "File not found" for ticket text that starts with `@developer`. The prefix
+  is applied in both paths even when the prompt already starts with a newline.
+- **pi resumes with `--session <id>`, never `-r <id>`.** In pi, `-r` is a
+  boolean session *picker* and does not take a value. Measured behaviour of
+  `pi -p --mode json -r <id>`: pi opens the interactive picker, writes zero
+  bytes to stdout, and exits 0. Under the daemon that yields no `session`
+  event at all, so the turn either fails the missing-session-id check or
+  stalls until the idle watchdog kills it. `--session <id>` is the only
+  resume flag that works; it is verified to carry context across turns.
+- **pi must always use `--no-approve`; never pass `-a` or `--approve`.** An
+  interactive trust approval inherited from global settings would let a
+  checked-out repo load extensions, skills, prompts, and themes;
+  `--no-approve` makes daemon behavior deterministic.
 - **`OPENCODE_PERMISSION` is injected into the sandbox env for every turn** to
   pre-answer the three permissions that default to `ask` (external_directory,
   doom_loop, read); do not delete it as redundant with
   `--dangerously-skip-permissions` — that flag auto-approves only top-level
   session events, so a subagent permission ask would hang the turn forever.
-- **OMP needs no `OPENCODE_PERMISSION` equivalent.** Its `--auto-approve`
-  setting lets a task-tool subagent run to completion; the OpenCode
-  subagent-permission hang does not reproduce.
+- **OMP and pi need no `OPENCODE_PERMISSION` equivalent.** OMP's
+  `--auto-approve` setting lets a task-tool subagent run to completion; pi has
+  no tool-approval gate, so the OpenCode subagent-permission hang does not
+  reproduce.
 - **Turns have an idle watchdog on top of the absolute timeout.** `_execute`
   drains stdout/stderr with one thread per stream and kills the process when
   neither produced output for `turn_idle_timeout_seconds` (default 1200s) or
@@ -190,9 +216,15 @@ shutting down, or the ticket is no longer triggered — see `_is_still_triggered
   the parent's NDJSON stdout is silent while a subagent task runs, so without
   the flag stdout alone is no liveness signal. Do not filter out the hourly
   `cleanup prune` log line; it resets the watchdog, and that is accepted.
-  OMP needs no `--print-logs` equivalent: it emits `tool_execution_update`
-  roughly once a second on the parent stream while a subagent runs, so stdout
-  alone is a real liveness signal.
+  OMP and pi need no `--print-logs` equivalent: both emit
+  `tool_execution_update` roughly once a second on the parent stream while a
+  subagent runs, so stdout alone is a real liveness signal.
+- **Do not trust pi-family JSON-mode exit codes for mid-turn failures.**
+  `_validate_final_turn` must inspect the last `turn_end`'s
+  `message.stopReason` because auto-retry emits several; treat `error` and
+  `aborted` as failures and surface `message.errorMessage`. pi and OMP can exit
+  0 after an API failure. Check `returncode < 0` first so a signal kill remains
+  a cancellation.
 - **Sessions are tagged with the agent that created them.** `TicketState.agent`
   and `SessionRecord.agent` persist the tag; `None` is a pre-change record and
   reads as `opencode`. Because session IDs are adapter-specific, a mismatch
@@ -343,9 +375,10 @@ Tests heavily use `unittest.mock`. Look at `tests/test_orchestrator.py` for
 the patterns — fake `LinearClient`, mocked `run_initial`/`run_resume`,
 `tmp_path` fixtures for state files. Integration tests under the
 `integration` marker shell out to `bwrap` and `git`; they do **not** invoke
-  the real `opencode` or `omp` binary or any LLM. Don't add tests that do — they're
-flaky (model nondeterminism), costly (API calls), and exercise OpenCode's
-behaviour, not ours. The NDJSON parser is unit-tested against a fixture.
+the real `opencode`, `omp` or `pi` binary or any LLM. Don't add tests that do —
+they're flaky (model nondeterminism), costly (API calls), and exercise the
+agent's behaviour, not ours. The NDJSON parsers are unit-tested against
+fixtures.
 
 ## Conventions
 

@@ -424,9 +424,8 @@ class TestRunInSandbox:
         assert "LEGACY_OK" in output, f"~/.opencode not writable: {output}"
         assert "XDG_OK" in output, f"~/.local/share/opencode not writable: {output}"
 
-    def test_opencode_dirs_missing_ok(self, tmp_path: Path) -> None:
-        """Verify that --bind-try for ~/.opencode and ~/.local/share/opencode
-        does not fail when those directories are missing on the host."""
+    def test_agent_state_dirs_missing_ok(self, tmp_path: Path) -> None:
+        """Verify missing OpenCode, OMP, and pi state dirs do not fail."""
         _require_bwrap()
 
         workspace = tmp_path / "workspace"
@@ -453,7 +452,7 @@ class TestRunInSandbox:
             output = stdout.decode(errors="replace").strip()
 
             assert proc.returncode == 0, (
-                f"Sandbox failed when OpenCode dirs are missing: "
+                "Sandbox failed when coding-agent state dirs are missing: "
                 f"stderr={stderr.decode(errors='replace')}"
             )
             assert output == "sandbox-ok"
@@ -461,14 +460,16 @@ class TestRunInSandbox:
             if old_home:
                 os.environ["HOME"] = old_home
 
-    def test_omp_dir_bind_try_emitted(
+    def test_agent_state_dirs_bind_try_emitted(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Emit an optional read-write bind for OMP state."""
+        """Emit optional read-write binds for OMP and pi state."""
         workspace = tmp_path / "workspace"
         workspace.mkdir()
         fake_home = tmp_path / "fake_home"
         fake_home.mkdir()
+        pi_dir = fake_home / ".pi"
+        pi_dir.mkdir()
         monkeypatch.setenv("HOME", str(fake_home))
 
         with patch(
@@ -486,6 +487,7 @@ class TestRunInSandbox:
         args = popen_mock.call_args[0][0]
         omp_dir = str(fake_home / ".omp")
         assert ("--bind-try", omp_dir, omp_dir) in zip(args, args[1:], args[2:])
+        assert ("--bind-try", str(pi_dir), str(pi_dir)) in zip(args, args[1:], args[2:])
 
     def test_extra_rw_paths_writable(self, tmp_path: Path) -> None:
         """Verify that extra_rw_paths are writable inside the sandbox."""

@@ -78,11 +78,11 @@ linear:
 # ---------------------------------------------------------------------------
 
 # Which coding-agent CLI the daemon launches (default: opencode).
-# One of `opencode` or `omp`.  Global for the whole daemon — there is no
+# One of `opencode`, `omp`, or `pi`.  Global for the whole daemon — there is no
 # per-project or per-issue override.  The binary must be on the sandbox
 # PATH (see SYMPHONY_SANDBOX_PATH); the daemon refuses to start otherwise.
-# The two agents do not share sessions: changing this value makes a ticket
-# holding a session from the other agent start a fresh session on its next
+# The agents do not share sessions: changing this value makes a ticket
+# holding a session from a different agent start a fresh session on its next
 # turn, losing that ticket's conversation history.
 agent: opencode
 

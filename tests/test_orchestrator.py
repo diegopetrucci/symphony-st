@@ -34,6 +34,7 @@ from symphony_linear.orchestrator import (
     _ActiveServe,
     _IGNORED_COMMENT_BODY,
     _format_comments_message,
+    _agent_callables,
 )
 from symphony_linear.project_config import (
     ProjectConfig,
@@ -219,6 +220,17 @@ class TestFormatCommentsMessage:
 
 
 # ---------------------------------------------------------------------------
+# Agent dispatch
+# ---------------------------------------------------------------------------
+
+
+class TestAgentCallables:
+    def test_unknown_agent_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="Unsupported coding agent"):
+            _agent_callables("other")
+
+
+# ---------------------------------------------------------------------------
 # New ticket pipeline
 # ---------------------------------------------------------------------------
 
@@ -318,6 +330,36 @@ class TestNewTicketPipeline:
         ticket_state = orchestrator._state.get("ticket-1")
         assert ticket_state is not None
         assert ticket_state.agent == "omp"
+
+    def test_pi_dispatches_initial_and_tags_session(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        orchestrator._config.agent = "pi"
+        with (
+            mock.patch("symphony_linear.orchestrator.clone_workspace") as mock_clone,
+            mock.patch(
+                "symphony_linear.orchestrator.finalize_workspace"
+            ) as mock_finalize,
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config"
+            ) as mock_load_config,
+            mock.patch("symphony_linear.orchestrator.run_initial") as mock_opencode,
+            mock.patch("symphony_linear.orchestrator.pi.run_initial") as mock_pi,
+        ):
+            issue = self._setup_mocks(
+                mock_clone,
+                mock_finalize,
+                mock_load_config,
+                mock_pi,
+                linear,
+            )
+            orchestrator._new_ticket_pipeline(issue)
+
+        mock_opencode.assert_not_called()
+        mock_pi.assert_called_once()
+        ticket_state = orchestrator._state.get("ticket-1")
+        assert ticket_state is not None
+        assert ticket_state.agent == "pi"
 
     def test_turn_input_marker_set_to_baseline(
         self, orchestrator: Orchestrator, linear: FakeLinearClient
@@ -2269,6 +2311,29 @@ class TestResumePipeline:
         mock_opencode.assert_not_called()
         mock_omp.assert_called_once()
 
+    def test_pi_dispatches_resume(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        orchestrator._config.agent = "pi"
+        ts = self._make_ts(agent="pi")
+        orchestrator._state.upsert(ts)
+        linear.set_response("list_comments_since", [_make_comment("c1", "Fix please")])
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config",
+                return_value=ProjectConfig(),
+            ),
+            mock.patch("symphony_linear.orchestrator.run_resume") as mock_opencode,
+            mock.patch(
+                "symphony_linear.orchestrator.pi.run_resume",
+                return_value=("Done!", None),
+            ) as mock_pi,
+        ):
+            orchestrator._resume_pipeline(ts)
+
+        mock_opencode.assert_not_called()
+        mock_pi.assert_called_once()
+
     def test_agent_mismatch_starts_initial_pipeline(
         self, orchestrator: Orchestrator, linear: FakeLinearClient
     ) -> None:
@@ -2320,6 +2385,59 @@ class TestResumePipeline:
         assert ticket_state is not None
         assert ticket_state.session_id == "omp-session"
         assert ticket_state.agent == "omp"
+        assert orchestrator._state.get_session("ticket-1") is None
+
+    def test_pi_discards_omp_session_and_starts_initial_pipeline(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """A pi turn cannot resume an OMP-created session."""
+        from symphony_linear.state import SessionRecord
+
+        orchestrator._config.agent = "pi"
+        ts = self._make_ts(agent="omp")
+        orchestrator._state.upsert(ts)
+        orchestrator._state.set_session(
+            "ticket-1", SessionRecord(session_id="ses-omp", agent="omp")
+        )
+        linear.set_response("list_comments_since", [_make_comment("c1", "Fix please")])
+        linear.set_response("get_issue", _make_issue(description="Fix the bug"))
+        linear.set_response(
+            "get_project",
+            Project(
+                id="proj-1",
+                name="Test",
+                links=[
+                    ProjectLink(label="Repo", url="https://github.com/org/repo.git")
+                ],
+            ),
+        )
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.clone_workspace",
+                return_value=("/tmp/ws/TEAM-1", False),
+            ),
+            mock.patch("symphony_linear.orchestrator.finalize_workspace"),
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config",
+                return_value=ProjectConfig(),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.pi.run_initial",
+                return_value=("pi-session", "Done.", None),
+            ) as mock_initial,
+            mock.patch("symphony_linear.orchestrator.pi.run_resume") as mock_resume,
+        ):
+            orchestrator._resume_pipeline(ts)
+
+        mock_resume.assert_not_called()
+        mock_initial.assert_called_once()
+        prompt = mock_initial.call_args.kwargs["prompt"]
+        assert "Fix the bug" in prompt
+        assert "Fix please" in prompt
+        ticket_state = orchestrator._state.get("ticket-1")
+        assert ticket_state is not None
+        assert ticket_state.session_id == "pi-session"
+        assert ticket_state.agent == "pi"
         assert orchestrator._state.get_session("ticket-1") is None
 
     def test_resume_turn_clears_cleanup_refused_state(
