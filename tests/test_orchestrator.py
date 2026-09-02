@@ -360,6 +360,36 @@ class TestNewTicketPipeline:
         ticket_state = orchestrator._state.get("ticket-1")
         assert ticket_state is not None
         assert ticket_state.agent == "pi"
+        # Default binary is "pi" when agent_binary is None.
+        assert mock_pi.call_args.kwargs.get("binary") == "pi"
+
+    def test_pi_agent_binary_override(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """agent_binary is forwarded to pi.run_initial."""
+        orchestrator._config.agent = "pi"
+        orchestrator._config.agent_binary = "tlh"
+        with (
+            mock.patch("symphony_linear.orchestrator.clone_workspace") as mock_clone,
+            mock.patch(
+                "symphony_linear.orchestrator.finalize_workspace"
+            ) as mock_finalize,
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config"
+            ) as mock_load_config,
+            mock.patch("symphony_linear.orchestrator.pi.run_initial") as mock_pi,
+        ):
+            issue = self._setup_mocks(
+                mock_clone,
+                mock_finalize,
+                mock_load_config,
+                mock_pi,
+                linear,
+            )
+            orchestrator._new_ticket_pipeline(issue)
+
+        mock_pi.assert_called_once()
+        assert mock_pi.call_args.kwargs.get("binary") == "tlh"
 
     def test_turn_input_marker_set_to_baseline(
         self, orchestrator: Orchestrator, linear: FakeLinearClient
@@ -2333,6 +2363,32 @@ class TestResumePipeline:
 
         mock_opencode.assert_not_called()
         mock_pi.assert_called_once()
+        # Default binary is "pi" when agent_binary is None.
+        assert mock_pi.call_args.kwargs.get("binary") == "pi"
+
+    def test_pi_agent_binary_override_resume(
+        self, orchestrator: Orchestrator, linear: FakeLinearClient
+    ) -> None:
+        """agent_binary is forwarded to pi.run_resume."""
+        orchestrator._config.agent = "pi"
+        orchestrator._config.agent_binary = "tlh"
+        ts = self._make_ts(agent="pi")
+        orchestrator._state.upsert(ts)
+        linear.set_response("list_comments_since", [_make_comment("c1", "Fix please")])
+        with (
+            mock.patch(
+                "symphony_linear.orchestrator.load_project_config",
+                return_value=ProjectConfig(),
+            ),
+            mock.patch(
+                "symphony_linear.orchestrator.pi.run_resume",
+                return_value=("Done!", None),
+            ) as mock_pi,
+        ):
+            orchestrator._resume_pipeline(ts)
+
+        mock_pi.assert_called_once()
+        assert mock_pi.call_args.kwargs.get("binary") == "tlh"
 
     def test_agent_mismatch_starts_initial_pipeline(
         self, orchestrator: Orchestrator, linear: FakeLinearClient

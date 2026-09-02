@@ -7,6 +7,7 @@ reply, and context-window token count from pi's NDJSON stream.
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 from pathlib import Path
 from typing import Callable
@@ -44,15 +45,17 @@ def run_initial(
     tmp_path: str,
     files: list[str] | None = None,
     model: str | None = None,
+    binary: str = "pi",
 ) -> tuple[str, str, int | None]:
-    """Launch pi for a new session.
+    """Launch pi (or a compatible distro wrapper) for a new session.
 
-    Returns ``(session_id, final_message, context_tokens)``. ``files`` are
+    ``binary`` selects the executable while preserving pi's CLI and event
+    protocol. Returns ``(session_id, final_message, context_tokens)``. ``files`` are
     passed as pi positional attachment arguments and ``model`` optionally
     overrides the primary agent's model.
     """
     cmd: list[str] = [
-        "pi",
+        binary,
         "-p",
         "--mode",
         "json",
@@ -76,7 +79,7 @@ def run_initial(
         idle_timeout_seconds=idle_timeout_seconds,
         on_subprocess=on_subprocess,
         hide_paths=hide_paths or [],
-        extra_rw_paths=extra_rw_paths or [],
+        extra_rw_paths=_agent_dir_rw_paths(extra_rw_paths),
         attachments_path=attachments_path,
         dir_map=dir_map,
         tmp_path=tmp_path,
@@ -98,10 +101,12 @@ def run_resume(
     tmp_path: str,
     files: list[str] | None = None,
     model: str | None = None,
+    binary: str = "pi",
 ) -> tuple[str, int | None]:
-    """Resume a pi session with a follow-up message.
+    """Resume a pi (or compatible distro wrapper) session with a follow-up message.
 
-    Returns ``(final_message, context_tokens)``. An empty session ID is
+    ``binary`` selects the executable while preserving pi's CLI and event
+    protocol. Returns ``(final_message, context_tokens)``. An empty session ID is
     rejected so pi cannot silently start an unrelated new session.
     """
     if not session_id:
@@ -111,7 +116,7 @@ def run_resume(
         )
 
     cmd: list[str] = [
-        "pi",
+        binary,
         "-p",
         "--mode",
         "json",
@@ -135,12 +140,64 @@ def run_resume(
         idle_timeout_seconds=idle_timeout_seconds,
         on_subprocess=on_subprocess,
         hide_paths=hide_paths or [],
-        extra_rw_paths=extra_rw_paths or [],
+        extra_rw_paths=_agent_dir_rw_paths(extra_rw_paths),
         attachments_path=attachments_path,
         dir_map=dir_map,
         tmp_path=tmp_path,
     )
     return final_message, context_tokens
+
+
+def _agent_dir_rw_paths(extra_rw_paths: list[str] | None) -> list[str]:
+    """Return extra_rw_paths extended with the pi agent dir when configured.
+
+    The default ``~/.pi`` location is handled in sandbox.py via
+    ``--bind-try``; only the non-default ``PI_CODING_AGENT_DIR`` path needs
+    explicit ``--bind`` treatment here.  ``--bind`` is fatal for missing
+    paths, so we only add it when the directory actually exists on the host.
+    """
+    base = list(extra_rw_paths or [])
+
+    agent_dir_env = os.environ.get("PI_CODING_AGENT_DIR")
+    if not agent_dir_env:
+        return base
+
+    agent_dir = Path(agent_dir_env).expanduser()
+    if not os.path.isdir(agent_dir):
+        logger.warning(
+            "PI_CODING_AGENT_DIR is set to %s but that directory does not exist "
+            "on the host. The sandbox read-write bind will be skipped (--bind is "
+            "fatal on missing paths). pi will resolve the path under the "
+            "read-only root bind and crash with EROFS at the first session "
+            "flush. Create the directory on the host before starting the daemon.",
+            agent_dir,
+        )
+        return base
+
+    resolved = os.path.realpath(agent_dir)
+    # Dedupe: skip if the resolved path is already in the list.
+    # Expand ~ in caller-supplied entries before realpath so that a tilde
+    # form (e.g. "~/.the-last-harness/agent") matches the expanded
+    # PI_CODING_AGENT_DIR path and does not produce a duplicate bind.
+    existing_realpaths = {os.path.realpath(Path(p).expanduser()) for p in base}
+    if resolved not in existing_realpaths:
+        base.append(str(agent_dir))
+
+    return base
+
+
+def _build_env() -> dict[str, str]:
+    """Build the environment dict for the sandboxed pi process.
+
+    PI_CODING_AGENT_SESSION_DIR is deliberately NOT forwarded: sessions fall
+    back to <agent-dir>/sessions, which is always inside the read-write bind
+    established by _agent_dir_rw_paths, so no separate bind is needed.
+    """
+    env: dict[str, str] = {"HOME": str(Path.home())}
+    pi_agent_dir = os.environ.get("PI_CODING_AGENT_DIR")
+    if pi_agent_dir:
+        env["PI_CODING_AGENT_DIR"] = pi_agent_dir
+    return env
 
 
 def _execute(
@@ -163,7 +220,7 @@ def _execute(
         timeout_seconds=timeout_seconds,
         idle_timeout_seconds=idle_timeout_seconds,
         on_subprocess=on_subprocess,
-        env={"HOME": str(Path.home())},
+        env=_build_env(),
         hide_paths=hide_paths,
         extra_rw_paths=extra_rw_paths or [],
         attachments_path=attachments_path,

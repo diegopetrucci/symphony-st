@@ -126,6 +126,65 @@ class TestLoadConfig:
 
         config = load_config(tmp_path)
         assert config.agent == "pi"
+        assert config.agent_binary is None
+
+    def test_agent_binary_defaults_to_none(self, tmp_path: Path) -> None:
+        cfg = {
+            "linear": {
+                "api_key": "test-key",
+            },
+        }
+        _write_yaml(tmp_path / "config.yaml", cfg)
+
+        config = load_config(tmp_path)
+        assert config.agent == "opencode"
+        assert config.agent_binary is None
+
+    def test_agent_binary_is_normalized_with_pi(self, tmp_path: Path) -> None:
+        cfg = {
+            "agent": "pi",
+            "agent_binary": "  tlh  ",
+            "linear": {
+                "api_key": "test-key",
+            },
+        }
+        _write_yaml(tmp_path / "config.yaml", cfg)
+
+        config = load_config(tmp_path)
+        assert config.agent == "pi"
+        assert config.agent_binary == "tlh"
+
+    @pytest.mark.parametrize("agent", ["opencode", "omp"])
+    def test_agent_binary_rejected_for_non_pi(self, tmp_path: Path, agent: str) -> None:
+        cfg = {
+            "agent": agent,
+            "agent_binary": "other-binary",
+            "linear": {
+                "api_key": "test-key",
+            },
+        }
+        _write_yaml(tmp_path / "config.yaml", cfg)
+
+        with pytest.raises(
+            ValueError, match="agent_binary is only supported with agent: pi"
+        ):
+            load_config(tmp_path)
+
+    @pytest.mark.parametrize("agent_binary", ["", "   "])
+    def test_agent_binary_empty_or_whitespace_rejected(
+        self, tmp_path: Path, agent_binary: str
+    ) -> None:
+        cfg = {
+            "agent": "pi",
+            "agent_binary": agent_binary,
+            "linear": {
+                "api_key": "test-key",
+            },
+        }
+        _write_yaml(tmp_path / "config.yaml", cfg)
+
+        with pytest.raises(ValueError, match="agent_binary"):
+            load_config(tmp_path)
 
     def test_invalid_agent_is_rejected(self, tmp_path: Path) -> None:
         cfg = {

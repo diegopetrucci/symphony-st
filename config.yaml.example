@@ -86,6 +86,14 @@ linear:
 # turn, losing that ticket's conversation history.
 agent: opencode
 
+# Optional. Override the launched binary name for the Pi adapter only.
+# Wrapper distros that set their own agent directory need that directory
+# configured read-write here; it must already exist on the host (`~` is fine).
+# For TLH, set `agent: pi` and `agent_binary: tlh`, then either export
+# PI_CODING_AGENT_DIR=~/.the-last-harness/agent in the daemon environment,
+# or add sandbox.extra_rw_paths: ["~/.the-last-harness/agent"] below.
+# agent_binary: tlh
+
 # Optional. Model overrides for the primary agent.  A `Model: <value>`
 # label runs an issue's turns with `--model <resolved>` passed to the
 # selected agent, first turn and resumes alike.  The label is read from

@@ -76,12 +76,13 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(1)
 
     sandbox_path = resolve_sandbox_path()
-    if shutil.which(config.agent, path=sandbox_path) is None:
+    binary = config.agent_binary or config.agent
+    if shutil.which(binary, path=sandbox_path) is None:
         logger.error(
             "Configured agent binary %r was not found on sandbox PATH %r. "
             "Install it there, set SYMPHONY_SANDBOX_PATH, or choose another "
-            "'agent' value in config.yaml.",
-            config.agent,
+            "'agent' value in config.yaml (or override with 'agent_binary').",
+            binary,
             sandbox_path,
         )
         sys.exit(1)

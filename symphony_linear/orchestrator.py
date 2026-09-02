@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import signal
 import subprocess
@@ -116,14 +117,18 @@ def _format_comments_message(comments: list[Comment]) -> str:
     return "\n\n".join(parts)
 
 
-def _agent_callables(agent: str) -> tuple[Any, Any]:
+def _agent_callables(agent: str, agent_binary: str | None = None) -> tuple[Any, Any]:
     """Return the initial and resume callables for a configured agent."""
     if agent == "opencode":
         return run_initial, run_resume
     if agent == "omp":
         return omp.run_initial, omp.run_resume
     if agent == "pi":
-        return pi.run_initial, pi.run_resume
+        binary = agent_binary or "pi"
+        return (
+            functools.partial(pi.run_initial, binary=binary),
+            functools.partial(pi.run_resume, binary=binary),
+        )
     raise ValueError(f"Unsupported coding agent: {agent!r}")
 
 
@@ -1661,7 +1666,9 @@ class Orchestrator:
         )
 
         try:
-            agent_run_initial, _ = _agent_callables(self._config.agent)
+            agent_run_initial, _ = _agent_callables(
+                self._config.agent, self._config.agent_binary
+            )
             session_id, final_message, _context_tokens = agent_run_initial(
                 workspace_path=workspace_path,
                 prompt=prompt,
@@ -1997,7 +2004,9 @@ class Orchestrator:
         )
 
         try:
-            _, agent_run_resume = _agent_callables(self._config.agent)
+            _, agent_run_resume = _agent_callables(
+                self._config.agent, self._config.agent_binary
+            )
             final_message, _context_tokens = agent_run_resume(
                 workspace_path=ticket_state.workspace_path,
                 session_id=ticket_state.session_id,

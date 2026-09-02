@@ -222,6 +222,16 @@ class AppConfig(BaseModel):
         "opencode",
         description="Coding-agent CLI to run: 'opencode' (default), 'omp', or 'pi'",
     )
+    agent_binary: str | None = Field(
+        None,
+        description=(
+            "Executable name or path that overrides the launched binary for the "
+            "Pi adapter. Pi has a distro ecosystem (OMP is one); distros like TLH "
+            "ship a differently-named wrapper binary with identical CLI and JSON "
+            "output, so agent: pi + agent_binary: tlh drives them without a new "
+            "adapter module. Only supported with agent: pi."
+        ),
+    )
     linear: _LinearConfig | None = Field(
         None, description="Linear backend configuration block"
     )
@@ -282,6 +292,21 @@ class AppConfig(BaseModel):
                     f"'anthropic/claude-opus-5'."
                 )
         return v
+
+    @field_validator("agent_binary")
+    @classmethod
+    def _normalize_agent_binary(cls, v: str | None) -> str | None:
+        return v.strip() if v is not None else None
+
+    @model_validator(mode="after")
+    def _validate_agent_binary(self) -> AppConfig:
+        """Validate agent_binary: pi-only and non-empty."""
+        if self.agent_binary is not None:
+            if self.agent != "pi":
+                raise ValueError("agent_binary is only supported with agent: pi")
+            if not self.agent_binary.strip():
+                raise ValueError("agent_binary must not be empty or whitespace-only")
+        return self
 
     @model_validator(mode="before")
     @classmethod

@@ -299,10 +299,44 @@ The selected binary (`opencode`, `omp`, or `pi`) must be on the sandbox's
 `$PATH`. The sandbox uses `SYMPHONY_SANDBOX_PATH` when it is set, otherwise it
 uses the daemon's `$PATH`. Agents do not share sessions: changing `agent` makes
 a ticket with a session from a different agent start a fresh session on its next
-turn instead of resuming the old one.
+turn instead of resuming the old one. Changing `agent_binary` alone does not
+invalidate an existing session, so a ticket mid-conversation may fail to resume
+if the session lives under the previous wrapper's agent directory.
 
 `pi` keeps credentials in `~/.pi/agent/auth.json`, a separate vault from OMP's:
 authenticating OMP does not authenticate pi.
+
+For `agent: pi`, the optional `agent_binary` key selects a compatible distro
+wrapper, such as TLH's `tlh`. Wrappers that keep pi's default `~/.pi` agent
+directory need no extra configuration. If a wrapper sets a non-default agent
+directory, configure it in one of these two ways; the directory must already
+exist on the host, and `~` values are supported:
+
+1. Export `PI_CODING_AGENT_DIR` in the daemon's environment, matching the
+   directory the wrapper sets. The daemon-side value selects the host path to
+   bind read-write; the wrapper's own export wins inside the sandbox, so a
+   mismatch binds the wrong directory.
+2. Add the wrapper's directory to `sandbox.extra_rw_paths` in `config.yaml`.
+
+For TLH, use:
+
+```yaml
+agent: pi
+agent_binary: tlh
+```
+
+Then choose either:
+
+```bash
+export PI_CODING_AGENT_DIR=~/.the-last-harness/agent
+```
+
+or:
+
+```yaml
+sandbox:
+  extra_rw_paths: ["~/.the-last-harness/agent"]
+```
 
 ### Full annotated config
 
